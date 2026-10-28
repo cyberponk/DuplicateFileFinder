@@ -1,0 +1,9 @@
+# Build output (build.cmd makes it)
+*.exe
+
+# Personal test files: results, crash reports, screenshots, sample media
+*.dupes
+crash.txt
+*.jpg
+*.mp4
+*.stackdump
