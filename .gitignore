@@ -7,3 +7,5 @@ crash.txt
 *.jpg
 *.mp4
 *.stackdump
+/Releases/
+/bin/

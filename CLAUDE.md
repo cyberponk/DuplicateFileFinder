@@ -6,6 +6,7 @@ Target PCs include Windows Server 2022 (the user copies the exe to the server's 
 
 ## Build and test
 - Build: `build.cmd` (uses the csc.exe that ships with .NET Framework 4.x; no install needed).
+  Output: `bin\DuplicateFileFinder.exe`.
   From Git Bash: `cmd //c "$(cygpath -w "$PWD/build.cmd")"`.
 - No test suite. Test by loading the exe with `[Reflection.Assembly]::LoadFrom` in a hidden
   PowerShell harness (run with `timeout`), or start the exe and capture it with PrintWindow.
@@ -31,3 +32,11 @@ Target PCs include Windows Server 2022 (the user copies the exe to the server's 
 ## Git
 - Local repo only, branch `main`. v1.0.0 is tagged. Personal test files (.dupes, .mp4,
   .jpg, crash.txt) and the exe are ignored; never commit them.
+
+<!-- repo-versioning -->
+## Versioning
+
+This project uses the `repo-versioning` skill (config: `.versioning.json`).
+- Every build goes through the skill's `version.py build`, which bumps the patch version.
+- When asked to commit, use the skill's release flow (minor bump, release folder,
+  changelog, git commit and tag) instead of a plain `git commit`.

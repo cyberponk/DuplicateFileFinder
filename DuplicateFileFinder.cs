@@ -21,7 +21,7 @@ using System.Windows.Forms;
 // Without this, .NET treats the program as a 4.0 app and turns off long path support
 [assembly: TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 [assembly: System.Reflection.AssemblyTitle("Duplicate File Finder")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
 
 namespace DuplicateFileFinder
 {

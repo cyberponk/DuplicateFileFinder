@@ -1,0 +1,12 @@
+{
+  "version_files": [
+    {
+      "path": "DuplicateFileFinder.cs",
+      "pattern": "AssemblyVersion\\(\"(\\d+\\.\\d+\\.\\d+)\\.0\"\\)"
+    }
+  ],
+  "build_command": ".\\build.cmd",
+  "copy_build": true,
+  "build_output": "bin",
+  "releases_dir": "Releases"
+}
