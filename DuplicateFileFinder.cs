@@ -21,7 +21,7 @@ using System.Windows.Forms;
 // Without this, .NET treats the program as a 4.0 app and turns off long path support
 [assembly: TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 [assembly: System.Reflection.AssemblyTitle("Duplicate File Finder")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
 
 namespace DuplicateFileFinder
 {
@@ -1484,6 +1484,100 @@ namespace DuplicateFileFinder
         }
     }
 
+    // ---------------------------------------------------------------- picture
+
+    // PictureBox's Zoom mode shrinks pictures with GDI+'s default interpolation, which
+    // skips most pixels of a large photo (jagged, grainy). This one draws a copy scaled
+    // with high-quality bicubic filtering, made again when the size changes; while the
+    // window is being resized it draws the fast way and remakes the copy just after.
+    // Animated GIFs are left to PictureBox, which animates them.
+    class SmoothPictureBox : PictureBox
+    {
+        Bitmap scaled;           // the picture scaled to fit, or null
+        Size scaledFor = Size.Empty;            // the fitted size that copy was made for
+        readonly Timer rescale = new Timer { Interval = 150 };
+
+        public SmoothPictureBox()
+        {
+            SizeMode = PictureBoxSizeMode.Zoom;
+            rescale.Tick += (s, e) => { rescale.Stop(); MakeScaled(); Invalidate(); };
+        }
+
+        public new Image Image
+        {
+            get { return base.Image; }
+            set { base.Image = value; MakeScaled(); }
+        }
+
+        // Where the picture goes: as large as fits, centered (as Zoom mode)
+        Rectangle Fit()
+        {
+            var img = base.Image;
+            if (img == null || ClientSize.Width <= 0 || ClientSize.Height <= 0) return Rectangle.Empty;
+            double scale = Math.Min((double)ClientSize.Width / img.Width, (double)ClientSize.Height / img.Height);
+            int w = Math.Max(1, (int)Math.Round(img.Width * scale)), h = Math.Max(1, (int)Math.Round(img.Height * scale));
+            return new Rectangle((ClientSize.Width - w) / 2, (ClientSize.Height - h) / 2, w, h);
+        }
+
+        void MakeScaled()
+        {
+            if (scaled != null) { scaled.Dispose(); scaled = null; }
+            var img = base.Image;
+            var r = Fit();
+            scaledFor = r.Size;
+            if (img == null || r.IsEmpty || ImageAnimator.CanAnimate(img) || r.Size == img.Size) return;
+            try
+            {
+                scaled = new Bitmap(r.Width, r.Height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+                using (var g = Graphics.FromImage(scaled))
+                using (var attributes = new System.Drawing.Imaging.ImageAttributes())
+                {
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                    g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+                    // Without this the edges fade into a faint border
+                    attributes.SetWrapMode(System.Drawing.Drawing2D.WrapMode.TileFlipXY);
+                    g.DrawImage(img, new Rectangle(0, 0, r.Width, r.Height), 0, 0, img.Width, img.Height, GraphicsUnit.Pixel, attributes);
+                }
+            }
+            catch (Exception)
+            {
+                // Out of memory, an odd picture format...: drawn the plain way instead
+                if (scaled != null) { scaled.Dispose(); scaled = null; }
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var img = base.Image;
+            var r = Fit();
+            if (img == null || ImageAnimator.CanAnimate(img)) base.OnPaint(e);
+            else if (r.Size != scaledFor)
+            {
+                // Being resized: the fast way for now
+                base.OnPaint(e);
+                rescale.Stop();
+                rescale.Start();
+            }
+            else if (scaled != null)
+            {
+                e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+                e.Graphics.DrawImage(scaled, r);
+            }
+            else base.OnPaint(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                rescale.Dispose();
+                if (scaled != null) { scaled.Dispose(); scaled = null; }
+            }
+            base.Dispose(disposing);
+        }
+    }
+
     // ------------------------------------------------------------------- tree
 
     // The checkboxes are drawn as state images, because the built-in TreeView
@@ -1640,9 +1734,9 @@ namespace DuplicateFileFinder
         ToolStripTextBox txtFilter;
         ToolStripComboBox cboSort, cboView;
         DupTree tree;
-        SplitContainer split;
+        SplitContainer split, infoSplit;
         TextBox txtInfo, txtPreview;
-        PictureBox picture;
+        SmoothPictureBox picture;
         Label lblNoPreview, lblChecked;
         ToolStripStatusLabel lblStatus, lblErrors;
         ToolStripProgressBar progress;
@@ -1905,6 +1999,10 @@ namespace DuplicateFileFinder
             };
             help.DropDownItems.Add(installVideoItem);
             tools.Items.Add(help);
+            // Right-aligned items go from the right edge, so this lands just left of Help
+            var version = typeof(MainForm).Assembly.GetName().Version;
+            tools.Items.Add(new ToolStripLabel(string.Format("Cyberponk  \u2022  v{0}.{1}.{2}", version.Major, version.Minor, version.Build))
+                            { Alignment = ToolStripItemAlignment.Right, ForeColor = SystemColors.GrayText });
 
             // Middle: tree | preview
             split = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.None };
@@ -1921,15 +2019,22 @@ namespace DuplicateFileFinder
             tree.UseCheckImages();
             split.Panel1.Controls.Add(tree);
 
-            var preview = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1, Padding = new Padding(4) };
-            preview.RowStyles.Add(new RowStyle(SizeType.Absolute, 130));
+            // Details and copies above, preview below; the splitter between them can be dragged,
+            // and clicking a file fits the details to their text (AutoSizeInfo)
+            infoSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, FixedPanel = FixedPanel.Panel1,
+                                             Panel1MinSize = 30, Panel2MinSize = 120 };
+            split.Panel2.Padding = new Padding(4);
+            split.Panel2.Controls.Add(infoSplit);
+            var preview = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
             preview.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             preview.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             txtInfo = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, BorderStyle = BorderStyle.None,
-                                    BackColor = SystemColors.Control, ScrollBars = ScrollBars.Vertical, WordWrap = false };
-            preview.Controls.Add(txtInfo, 0, 0);
+                                    BackColor = SystemColors.Control, WordWrap = false };
+            txtInfo.TextChanged += (s, e) => UpdateInfoScrollBars();
+            txtInfo.Resize += (s, e) => UpdateInfoScrollBars();
+            infoSplit.Panel1.Controls.Add(txtInfo);
             var host = new Panel { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White };
-            picture = new PictureBox { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom, Visible = false };
+            picture = new SmoothPictureBox { Dock = DockStyle.Fill, Visible = false };
             txtPreview = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false,
                                        Font = new Font("Consolas", 9f), Visible = false, BackColor = Color.White };
             lblNoPreview = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter, ForeColor = SystemColors.GrayText,
@@ -1942,14 +2047,14 @@ namespace DuplicateFileFinder
             host.Controls.Add(txtPreview);
             host.Controls.Add(lblNoPreview);
             previewHost = host;
-            preview.Controls.Add(host, 0, 1);
+            preview.Controls.Add(host, 0, 0);
             var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
             btnOpen = new Button { Text = "Open file", AutoSize = true, Enabled = false };
             btnShowFolder = new Button { Text = "Show in folder", AutoSize = true, Enabled = false };
             buttons.Controls.Add(btnOpen);
             buttons.Controls.Add(btnShowFolder);
-            preview.Controls.Add(buttons, 0, 2);
-            split.Panel2.Controls.Add(preview);
+            preview.Controls.Add(buttons, 0, 1);
+            infoSplit.Panel2.Controls.Add(preview);
 
             // Bottom: checked totals and Delete
             var bottom = new TableLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, ColumnCount = 4, Padding = new Padding(8, 4, 8, 4) };
@@ -2063,6 +2168,7 @@ namespace DuplicateFileFinder
         {
             base.OnLoad(e);
             split.SplitterDistance = (int)(split.Width * (savedSplitter ?? 0.62));
+            SetInfoHeight(130);
             // From here on, changes are saved
             loadingSettings = false;
         }
@@ -3050,7 +3156,8 @@ namespace DuplicateFileFinder
             info.AppendFormat("{0}\r\n{1} ({2:N0} bytes)   \u2022   modified {3:yyyy-MM-dd HH:mm:ss}",
                               f.FullPath, FormatSize(f.Size), f.Size, f.Modified.ToLocalTime());
             if (f.Stale) info.Append("\r\nChanged since the results were saved: " + f.StaleReason);
-            var copies = f.Group.Files.Where(x => !x.Deleted).ToList();
+            // The clicked copy first, the others in their usual order
+            var copies = f.Group.Files.Where(x => !x.Deleted).OrderBy(x => x != f).ToList();
             info.AppendFormat("\r\n\r\nAll {0} copies:", copies.Count);
             foreach (var c in copies)
             {
@@ -3058,6 +3165,7 @@ namespace DuplicateFileFinder
                 info.Append("\r\n" + mark + c.FullPath + (c.InArchive ? "   (inside archive)" : "") + (c == f ? "   <- this one" : ""));
             }
             txtInfo.Text = info.ToString();
+            AutoSizeInfo();
             if (f.InArchive)
             {
                 PreviewFromArchive(f);
@@ -3116,7 +3224,52 @@ namespace DuplicateFileFinder
             btnOpen.Enabled = true;
             txtInfo.AppendText("\r\n\r\nPreview and \"Open file\" use a temporary read-only copy extracted from the archive " +
                                "(deleted when another file is previewed or the app closes).");
+            AutoSizeInfo();
             ShowFileContent(path, size);
+        }
+
+        // Fits the details box to its lines, leaving at least half of the pane to the preview
+        // (a longer list scrolls). The user can still drag the splitter afterwards.
+        void AutoSizeInfo()
+        {
+            int lines = Math.Max(1, txtInfo.Lines.Length);
+            int height = lines * txtInfo.Font.Height + 6;
+            if (InfoTooWide()) height += SystemInformation.HorizontalScrollBarHeight;
+            SetInfoHeight(height);
+            UpdateInfoScrollBars();
+        }
+
+        // True when the longest line doesn't fit the details box (it doesn't wrap)
+        bool InfoTooWide()
+        {
+            int widest = 0;
+            foreach (var line in txtInfo.Lines)
+                widest = Math.Max(widest, TextRenderer.MeasureText(line, txtInfo.Font, Size.Empty, TextFormatFlags.NoPrefix).Width);
+            return widest > txtInfo.Width - SystemInformation.VerticalScrollBarWidth - 4;
+        }
+
+        // Shows each scrollbar of the details box only when its text needs it
+        void UpdateInfoScrollBars()
+        {
+            bool wide = InfoTooWide();
+            int room = txtInfo.Height - (wide ? SystemInformation.HorizontalScrollBarHeight : 0);
+            bool tall = txtInfo.Lines.Length * txtInfo.Font.Height + 4 > room;
+            var bars = wide && tall ? ScrollBars.Both : wide ? ScrollBars.Horizontal : tall ? ScrollBars.Vertical : ScrollBars.None;
+            if (txtInfo.ScrollBars == bars) return;
+            // Changing them remakes the box, which can select all its text and take the focus
+            bool hadFocus = txtInfo.Focused;
+            txtInfo.ScrollBars = bars;
+            txtInfo.Select(0, 0);
+            if (!hadFocus && txtInfo.Focused) tree.Focus();
+        }
+
+        void SetInfoHeight(int height)
+        {
+            int max = Math.Max(infoSplit.Panel1MinSize, Math.Min(infoSplit.Height / 2,
+                               infoSplit.Height - infoSplit.Panel2MinSize - infoSplit.SplitterWidth));
+            int distance = Math.Max(infoSplit.Panel1MinSize, Math.Min(max, height));
+            try { infoSplit.SplitterDistance = distance; }
+            catch (InvalidOperationException) { }   // the window is too small for both panes
         }
 
         // Called whenever the preview changes, and when the app closes
@@ -3162,7 +3315,7 @@ namespace DuplicateFileFinder
             lblNoPreview.Visible = true;
             try
             {
-                if (ImageExtensions.Contains(ext) && size < 200L * 1024 * 1024 && ShowPicture(path)) { }
+                if ((ImageExtensions.Contains(ext) || CodecExtensions.Value.Contains(ext)) && size < 200L * 1024 * 1024 && ShowPicture(path)) { }
                 else if (TextExtensions.Contains(ext))
                 {
                     const int max = 64 * 1024;
@@ -3206,14 +3359,16 @@ namespace DuplicateFileFinder
             }
         }
 
-        // A picture GDI+ can read; false (nothing shown) if it can't, e.g. a damaged file
+        // A picture at full size, read by GDI+ or else by the Windows image codecs (WebP,
+        // HEIC, camera RAW... when installed); false (nothing shown) if neither can read it
         bool ShowPicture(string path)
         {
             try
             {
                 // Loaded from memory, so the file isn't kept open (it may be deleted later)
                 previewStream = new MemoryStream(File.ReadAllBytes(path));
-                previewImage = Image.FromStream(previewStream);
+                try { previewImage = Image.FromStream(previewStream); }
+                catch (ArgumentException) { previewImage = DecodeWithCodec(previewStream); }
             }
             catch (Exception)
             {
@@ -3225,6 +3380,48 @@ namespace DuplicateFileFinder
             txtPreview.Visible = false;
             lblNoPreview.Visible = false;
             return true;
+        }
+
+        // File types the Windows image codecs (WIC) may read: those listed in the registry,
+        // plus the ones from Microsoft Store extensions, which aren't listed there (when one
+        // isn't installed, decoding fails and Explorer's thumbnail is shown instead).
+        // Read once, the first time a file is previewed.
+        static readonly Lazy<HashSet<string>> CodecExtensions = new Lazy<HashSet<string>>(() =>
+        {
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { ".webp", ".heic", ".heif", ".hif", ".avif", ".jxl", ".jxr", ".wdp", ".hdp", ".dds" };
+            const string decoders = @"CLSID\{7ED96837-96F0-4812-B211-F13C24117ED3}\Instance";
+            try
+            {
+                using (var instances = Microsoft.Win32.Registry.ClassesRoot.OpenSubKey(decoders))
+                    if (instances != null)
+                        foreach (var clsid in instances.GetSubKeyNames())
+                            using (var codec = Microsoft.Win32.Registry.ClassesRoot.OpenSubKey(@"CLSID\" + clsid))
+                            {
+                                var list = codec == null ? null : codec.GetValue("FileExtensions") as string;
+                                if (list != null)
+                                    foreach (var e in list.Split(',')) if (e.Trim().StartsWith(".")) result.Add(e.Trim());
+                            }
+            }
+            catch (Exception) { }
+            return result;
+        });
+
+        // The first frame of a picture, decoded by the Windows image codecs (through WPF)
+        static Bitmap DecodeWithCodec(Stream stream)
+        {
+            stream.Position = 0;
+            var decoder = System.Windows.Media.Imaging.BitmapDecoder.Create(stream,
+                System.Windows.Media.Imaging.BitmapCreateOptions.None, System.Windows.Media.Imaging.BitmapCacheOption.OnLoad);
+            var frame = new System.Windows.Media.Imaging.FormatConvertedBitmap(decoder.Frames[0],
+                System.Windows.Media.PixelFormats.Pbgra32, null, 0);
+            var bitmap = new Bitmap(frame.PixelWidth, frame.PixelHeight, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+            var data = bitmap.LockBits(new Rectangle(0, 0, bitmap.Width, bitmap.Height),
+                                       System.Drawing.Imaging.ImageLockMode.WriteOnly, bitmap.PixelFormat);
+            try { frame.CopyPixels(System.Windows.Int32Rect.Empty, data.Scan0, data.Stride * data.Height, data.Stride); }
+            catch (Exception) { bitmap.UnlockBits(data); bitmap.Dispose(); throw; }
+            bitmap.UnlockBits(data);
+            return bitmap;
         }
 
         // ------------------------------------------- previews of other file types
@@ -3248,8 +3445,17 @@ namespace DuplicateFileFinder
         // Explorer's thumbnail (a frame of a video, a picture GDI+ can't read...)
         bool ShowThumbnail(string path)
         {
-            var thumbnail = ShellPreview.Thumbnail(path, 1024);
+            // As large as the pane, so it isn't stretched (Explorer's largest thumbnails are 2560)
+            int size = Math.Min(2560, Math.Max(1024, Math.Max(previewHost.ClientSize.Width, previewHost.ClientSize.Height)));
+            var thumbnail = ShellPreview.Thumbnail(path, size);
             if (thumbnail == null) return false;
+            // Say why the preview may look rough: without a preview handler (usually because the
+            // program for this file type isn't installed, e.g. Office), Windows only has a
+            // thumbnail, often a small picture saved inside the file
+            txtInfo.AppendText(string.Format("\r\n\r\nPreview: Explorer's thumbnail, {0} \u00D7 {1} pixels. This computer has no preview handler " +
+                                             "for {2} files (it comes with the program that opens them).",
+                                             thumbnail.Width, thumbnail.Height, Path.GetExtension(path)));
+            AutoSizeInfo();
             previewImage = thumbnail;
             picture.Image = previewImage;
             picture.Visible = true;
