@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.3.0 - 2026-10-30 - Problem tables and empty folders
+
+### Added
+- Option "Remove folders if empty after deleting" (bottom of the window, remembered): folders that deleting leaves completely empty are removed, and their parent folders too if that empties them. Only folders inside the searched folders; a searched folder itself is never removed. Removed folders are counted in the summary and listed in the deletion log.
+- When some files could not be deleted, a window shows a summary with a warning icon and a table of every file not deleted (before: a message box listing the first 15).
+- Shortcut letters in the tree's right-click menus, underlined: with the menu open, press the letter (e.g. K = Keep only this copy).
+
+### Changed
+- "Items that could not be read" is a maximized window with a table: Reason (auto-sized) and Path. Clicking the path opens Explorer with the item selected.
+- "Show in folder" opens Explorer with the file selected, also when that folder is already open in Explorer.
+- Clicking Scan clears the "N item(s) could not be read" link right away.
+
+### Fixed
+- A '&' in a file path in the right-click "Copies" submenu disappeared.
+- Opening a drive root folder (e.g. E:\) from the folder menu went to the wrong place.
+
 ## v1.2.0 - 2026-10-30 - Better preview and copies list
 
 ### Added

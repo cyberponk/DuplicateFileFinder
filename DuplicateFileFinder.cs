@@ -21,7 +21,7 @@ using System.Windows.Forms;
 // Without this, .NET treats the program as a 4.0 app and turns off long path support
 [assembly: TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 [assembly: System.Reflection.AssemblyTitle("Duplicate File Finder")]
-[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
 
 namespace DuplicateFileFinder
 {
@@ -1634,6 +1634,14 @@ namespace DuplicateFileFinder
         }
     }
 
+    // Something that went wrong with a file or folder: why, the path shown, and the path
+    // to select in Explorer (for a file inside an archive, the archive)
+    class ProblemItem
+    {
+        public readonly string Reason, Path, ShowPath;
+        public ProblemItem(string reason, string path, string showPath) { Reason = reason; Path = path; ShowPath = showPath; }
+    }
+
     // Tag of a folder node in the folder view
     class FolderTag
     {
@@ -1716,6 +1724,7 @@ namespace DuplicateFileFinder
         List<DupGroup> groups = new List<DupGroup>();
         List<DupGroup> shownGroups = new List<DupGroup>();   // the groups passing the filter
         List<string> errors = new List<string>();
+        List<string> scanRoots = new List<string>();     // the folders of the last scan
         bool busy;
         BackgroundWorker worker;
         Image previewImage;
@@ -1729,7 +1738,7 @@ namespace DuplicateFileFinder
         // Every folder added this session, in order; the ticked ones are those in the Folders box
         List<string> knownFolders = new List<string>();
         NumericUpDown numMinKb;
-        CheckBox chkHidden, chkSameName, chkArchives, chkVerify, chkPermanent;
+        CheckBox chkHidden, chkSameName, chkArchives, chkVerify, chkRemoveEmpty, chkPermanent;
         ToolStrip tools;
         ToolStripTextBox txtFilter;
         ToolStripComboBox cboSort, cboView;
@@ -1820,6 +1829,7 @@ namespace DuplicateFileFinder
             chkSameName.Checked = Flag(s, "SameName");
             chkArchives.Checked = Flag(s, "IncludeArchives");
             chkVerify.Checked = Flag(s, "RecompareContents");
+            chkRemoveEmpty.Checked = Flag(s, "RemoveEmptyFolders");
             // "Delete permanently" is deliberately not restored: it always starts unticked
             int? view = Number(s, "View"), sort = Number(s, "Sort");
             if (view >= 0 && view < cboView.Items.Count) cboView.SelectedIndex = view.Value;
@@ -1854,6 +1864,7 @@ namespace DuplicateFileFinder
             chkSameName.CheckedChanged += changed;
             chkArchives.CheckedChanged += changed;
             chkVerify.CheckedChanged += changed;
+            chkRemoveEmpty.CheckedChanged += changed;
             cboView.SelectedIndexChanged += changed;
             cboSort.SelectedIndexChanged += changed;
             split.SplitterMoved += (sender, e) => ScheduleSave();
@@ -1882,6 +1893,7 @@ namespace DuplicateFileFinder
                 { "SameName", chkSameName.Checked ? "1" : "0" },
                 { "IncludeArchives", chkArchives.Checked ? "1" : "0" },
                 { "RecompareContents", chkVerify.Checked ? "1" : "0" },
+                { "RemoveEmptyFolders", chkRemoveEmpty.Checked ? "1" : "0" },
                 { "View", cboView.SelectedIndex.ToString(CultureInfo.InvariantCulture) },
                 { "Sort", cboSort.SelectedIndex.ToString(CultureInfo.InvariantCulture) },
                 { "Window", string.Join(",", bounds.X, bounds.Y, bounds.Width, bounds.Height) },
@@ -2063,15 +2075,22 @@ namespace DuplicateFileFinder
             bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             lblChecked = new Label { AutoSize = true, Anchor = AnchorStyles.Left, Font = new Font(Font, FontStyle.Bold) };
-            chkVerify = new CheckBox { Text = "Re-compare contents before deleting (slower, safest)", AutoSize = true, Anchor = AnchorStyles.Right, Margin = new Padding(3, 6, 12, 3) };
-            chkPermanent = new CheckBox { Text = "Delete permanently (skip the Recycle Bin)", AutoSize = true, Anchor = AnchorStyles.Right,
-                                          Margin = new Padding(3, 6, 12, 3), ForeColor = Color.Firebrick };
+            chkVerify = new CheckBox { Text = "Re-compare contents before deleting (slower, safest)", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 3, 12, 0) };
+            chkRemoveEmpty = new CheckBox { Text = "Remove folders if empty after deleting", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 3, 12, 3) };
+            new ToolTip().SetToolTip(chkRemoveEmpty, "When deleting leaves a folder with nothing in it, the folder is removed too (and its parent folders, if that leaves them empty).\r\n" +
+                                                     "Only folders inside the folders being searched; those themselves are never removed.");
+            chkPermanent = new CheckBox { Text = "Delete permanently (skip the Recycle Bin)", AutoSize = true, Anchor = AnchorStyles.Left,
+                                          Margin = new Padding(3, 3, 12, 0), ForeColor = Color.Firebrick };
             new ToolTip().SetToolTip(chkPermanent, "Deleted files can't be restored from the Recycle Bin. Faster, and frees the space at once.");
             btnDelete = new Button { Text = "Delete checked files...", AutoSize = true, Padding = new Padding(8, 2, 8, 2), Font = new Font(Font, FontStyle.Bold) };
+            btnDelete.Anchor = AnchorStyles.Right;
             bottom.Controls.Add(lblChecked, 0, 0);
             bottom.Controls.Add(chkVerify, 1, 0);
+            bottom.Controls.Add(chkRemoveEmpty, 1, 1);
             bottom.Controls.Add(chkPermanent, 2, 0);
             bottom.Controls.Add(btnDelete, 3, 0);
+            bottom.SetRowSpan(lblChecked, 2);
+            bottom.SetRowSpan(btnDelete, 2);
 
             var status = new StatusStrip();
             lblStatus = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
@@ -2100,26 +2119,29 @@ namespace DuplicateFileFinder
                 var f = SelectedFile();
                 if (f == null) { e.Cancel = true; return; }
                 fileMenu.Items.AddRange(FileMenuItems(f, true));
+                ShowAccessKeys(fileMenu);
                 e.Cancel = false;
             };
             groupMenu = new ContextMenuStrip();
-            groupMenu.Items.Add("Keep the first copy, check the others", null, (s, e) => KeepFirstInSelectedGroup());
-            groupMenu.Items.Add("Uncheck this group", null, (s, e) => UncheckSelectedGroup());
+            groupMenu.Items.Add("&Keep the first copy, check the others", null, (s, e) => KeepFirstInSelectedGroup());
+            groupMenu.Items.Add("&Uncheck this group", null, (s, e) => UncheckSelectedGroup());
             folderMenu = new ContextMenuStrip();
-            folderMenu.Items.Add("Check all duplicates in this folder", null, (s, e) => SetNodeChecked(tree.SelectedNode, true));
-            folderMenu.Items.Add("Uncheck all duplicates in this folder", null, (s, e) => SetNodeChecked(tree.SelectedNode, false));
+            folderMenu.Items.Add("&Check all duplicates in this folder", null, (s, e) => SetNodeChecked(tree.SelectedNode, true));
+            folderMenu.Items.Add("&Uncheck all duplicates in this folder", null, (s, e) => SetNodeChecked(tree.SelectedNode, false));
             folderMenu.Items.Add(new ToolStripSeparator());
-            var folderAuto = new ToolStripMenuItem("Auto-select inside this folder");
+            var folderAuto = new ToolStripMenuItem("&Auto-select inside this folder");
             folderAuto.ToolTipText = "For each file with several copies in this folder and its subfolders, keep one of them and check the others. Copies elsewhere are not changed.";
-            folderAuto.DropDownItems.Add("Keep the newest copy, check the others", null, (s, e) => ApplyKeepRuleInFolder(tree.SelectedNode, KeepRule.Newest));
-            folderAuto.DropDownItems.Add("Keep the oldest copy, check the others", null, (s, e) => ApplyKeepRuleInFolder(tree.SelectedNode, KeepRule.Oldest));
-            folderAuto.DropDownItems.Add("Keep the copy with the shortest path, check the others", null, (s, e) => ApplyKeepRuleInFolder(tree.SelectedNode, KeepRule.ShortestPath));
-            folderAuto.DropDownItems.Add("Keep the copy with the longest path, check the others", null, (s, e) => ApplyKeepRuleInFolder(tree.SelectedNode, KeepRule.LongestPath));
-            folderAuto.DropDownItems.Add("Keep the first copy alphabetically, check the others", null, (s, e) => ApplyKeepRuleInFolder(tree.SelectedNode, KeepRule.FirstAlphabetically));
+            folderAuto.DropDownItems.Add("Keep the &newest copy, check the others", null, (s, e) => ApplyKeepRuleInFolder(tree.SelectedNode, KeepRule.Newest));
+            folderAuto.DropDownItems.Add("Keep the &oldest copy, check the others", null, (s, e) => ApplyKeepRuleInFolder(tree.SelectedNode, KeepRule.Oldest));
+            folderAuto.DropDownItems.Add("Keep the copy with the &shortest path, check the others", null, (s, e) => ApplyKeepRuleInFolder(tree.SelectedNode, KeepRule.ShortestPath));
+            folderAuto.DropDownItems.Add("Keep the copy with the &longest path, check the others", null, (s, e) => ApplyKeepRuleInFolder(tree.SelectedNode, KeepRule.LongestPath));
+            folderAuto.DropDownItems.Add("Keep the &first copy alphabetically, check the others", null, (s, e) => ApplyKeepRuleInFolder(tree.SelectedNode, KeepRule.FirstAlphabetically));
             folderMenu.Items.Add(folderAuto);
             folderMenu.Items.Add(new ToolStripSeparator());
-            folderMenu.Items.Add("Open folder", null, (s, e) => OpenFolder(tree.SelectedNode));
-            folderMenu.Items.Add("Expand everything below", null, (s, e) => { if (tree.SelectedNode != null) tree.SelectedNode.ExpandAll(); });
+            folderMenu.Items.Add("&Open folder", null, (s, e) => OpenFolder(tree.SelectedNode));
+            folderMenu.Items.Add("&Expand everything below", null, (s, e) => { if (tree.SelectedNode != null) tree.SelectedNode.ExpandAll(); });
+            ShowAccessKeys(groupMenu);
+            ShowAccessKeys(folderMenu);
 
             filterTimer = new Timer { Interval = 400 };
             filterTimer.Tick += (s, e) => { filterTimer.Stop(); BuildTree(); };
@@ -2157,7 +2179,7 @@ namespace DuplicateFileFinder
                     e.Handled = e.SuppressKeyPress = true;
                 }
             };
-            lblErrors.Click += (s, e) => ShowTextDialog("Items that could not be read", string.Join(Environment.NewLine, errors));
+            lblErrors.Click += (s, e) => ShowErrors();
             DragEnter += Form_DragEnter;
             DragDrop += Form_DragDrop;
             txtFolders.DragEnter += Form_DragEnter;
@@ -2517,7 +2539,10 @@ namespace DuplicateFileFinder
                 IncludeArchives = chkArchives.Checked
             };
             roots = roots.Select(Path.GetFullPath).ToList();
+            scanRoots = roots;
             groups = new List<DupGroup>();
+            errors.Clear();
+            ShowErrorsLink();
             BuildTree();
             SetBusy(true);
             btnCancel.Enabled = true;
@@ -2932,22 +2957,23 @@ namespace DuplicateFileFinder
         ToolStripItem[] FileMenuItems(FileEntry f, bool top)
         {
             var items = new List<ToolStripItem>();
-            var open = new ToolStripMenuItem("Open", null, (s, e) => OpenFile(f));
+            var open = new ToolStripMenuItem("&Open", null, (s, e) => OpenFile(f));
             if (top)
             {
                 if (menuBoldFont == null) menuBoldFont = new Font(fileMenu.Font, FontStyle.Bold);
                 open.Font = menuBoldFont;
             }
             items.Add(open);
-            items.Add(new ToolStripMenuItem("Show in folder", null, (s, e) => ShowInFolder(f)));
-            items.Add(new ToolStripMenuItem("Copy path", null, (s, e) => Clipboard.SetText(f.FullPath)));
+            items.Add(new ToolStripMenuItem("&Show in folder", null, (s, e) => ShowInFolder(f)));
+            items.Add(new ToolStripMenuItem("&Copy path", null, (s, e) => Clipboard.SetText(f.FullPath)));
             if (top)
             {
-                var copies = new ToolStripMenuItem("Copies");
+                var copies = new ToolStripMenuItem("Co&pies");
                 foreach (var c in f.Group.Files.Where(x => x != f && !x.Deleted))
                 {
                     string mark = c.Stale ? "[changed]" : c.Checked ? "[delete]" : "[keep]";
-                    var item = new ToolStripMenuItem(mark + "   " + c.FullPath + (c.InArchive ? "   (inside archive)" : ""));
+                    // "&&": a '&' in a path is shown, not taken as a shortcut key
+                    var item = new ToolStripMenuItem(mark + "   " + c.FullPath.Replace("&", "&&") + (c.InArchive ? "   (inside archive)" : ""));
                     if (c.Node == null)
                     {
                         // Not in the tree right now: its group is hidden by the filter
@@ -2965,25 +2991,45 @@ namespace DuplicateFileFinder
             }
             else
             {
-                items.Add(new ToolStripMenuItem("Jump to this copy", null, (s, e) => JumpTo(f)) { Enabled = f.Node != null });
+                items.Add(new ToolStripMenuItem("&Jump to this copy", null, (s, e) => JumpTo(f)) { Enabled = f.Node != null });
             }
             items.Add(new ToolStripSeparator());
             if (!f.Stale)
             {
                 if (f.Checked)
-                    items.Add(new ToolStripMenuItem("Uncheck (keep this copy)", null, (s, e) => ToggleFile(f)));
+                    items.Add(new ToolStripMenuItem("&Uncheck (keep this copy)", null, (s, e) => ToggleFile(f)));
                 else if (Selection.CanCheck(f))
-                    items.Add(new ToolStripMenuItem("Check for deletion", null, (s, e) => ToggleFile(f)));
+                    items.Add(new ToolStripMenuItem("Check for &deletion", null, (s, e) => ToggleFile(f)));
                 else
                     // The copy that is kept: only here, never through its checkbox
-                    items.Add(new ToolStripMenuItem("Delete this copy too...", null, (s, e) => DeleteKeptCopy(f)) { ForeColor = Color.Firebrick });
+                    items.Add(new ToolStripMenuItem("&Delete this copy too...", null, (s, e) => DeleteKeptCopy(f)) { ForeColor = Color.Firebrick });
             }
-            items.Add(new ToolStripMenuItem("Keep only this copy (check the others)", null, (s, e) => KeepOnly(f)));
-            items.Add(new ToolStripMenuItem("Check all copies in this folder and its subfolders", null,
+            items.Add(new ToolStripMenuItem("&Keep only this copy (check the others)", null, (s, e) => KeepOnly(f)));
+            items.Add(new ToolStripMenuItem("Check &all copies in this folder and its subfolders", null,
                                             (s, e) => CheckFolder(Path.GetDirectoryName(f.FullPath), true)));
-            items.Add(new ToolStripMenuItem("Uncheck all copies in this folder and its subfolders", null,
+            items.Add(new ToolStripMenuItem("Uncheck all copies i&n this folder and its subfolders", null,
                                             (s, e) => CheckFolder(Path.GetDirectoryName(f.FullPath), false)));
             return items.ToArray();
+        }
+
+        // Underlines each item's shortcut letter (pressing it while the menu is open runs the
+        // item). Windows hides the underlines when a menu is opened with the mouse.
+        static readonly ToolStripRenderer accessKeyRenderer = new AccessKeyRenderer();
+
+        class AccessKeyRenderer : ToolStripProfessionalRenderer
+        {
+            protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+            {
+                e.TextFormat &= ~TextFormatFlags.HidePrefix;
+                base.OnRenderItemText(e);
+            }
+        }
+
+        static void ShowAccessKeys(ToolStrip menu)
+        {
+            menu.Renderer = accessKeyRenderer;
+            foreach (var item in menu.Items.OfType<ToolStripMenuItem>())
+                if (item.HasDropDownItems) ShowAccessKeys(item.DropDown);
         }
 
         // Checks the copy that would be kept, after confirmation: then no copy of the
@@ -3018,7 +3064,7 @@ namespace DuplicateFileFinder
         {
             var folder = node == null ? null : node.Tag as FolderTag;
             if (folder == null) return;
-            try { Process.Start("explorer.exe", "\"" + folder.FullPath + "\""); }
+            try { Process.Start(new ProcessStartInfo(folder.FullPath) { UseShellExecute = true }); }
             catch (Exception ex) { MessageBox.Show(this, ex.Message, Text); }
         }
 
@@ -3581,8 +3627,39 @@ namespace DuplicateFileFinder
         void ShowInFolder(FileEntry f)
         {
             if (f == null) return;
-            try { Process.Start("explorer.exe", "/select,\"" + (f.InArchive ? f.Archive : f.FullPath) + "\""); }
+            try { ShowInExplorer(f.InArchive ? f.Archive : f.FullPath); }
             catch (Exception ex) { MessageBox.Show(this, ex.Message, Text); }
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr ILCreateFromPathW(string path);
+
+        [DllImport("shell32.dll")]
+        static extern int SHOpenFolderAndSelectItems(IntPtr folder, uint count, IntPtr items, uint flags);
+
+        [DllImport("shell32.dll")]
+        static extern void ILFree(IntPtr pidl);
+
+        // Opens the folder holding path in Explorer, with that file (or folder) selected.
+        // "explorer.exe /select" is ignored in some cases (e.g. when that folder is already
+        // open), so the shell function Explorer itself uses comes first.
+        static void ShowInExplorer(string path)
+        {
+            if (!File.Exists(path) && !Directory.Exists(path))
+            {
+                // Gone (deleted, moved): show the folder it was in, if that's still there
+                string parent = Path.GetDirectoryName(path);
+                if (parent == null || !Directory.Exists(parent)) throw new FileNotFoundException("It no longer exists:\r\n" + path);
+                Process.Start(new ProcessStartInfo(parent) { UseShellExecute = true });
+                return;
+            }
+            IntPtr pidl = ILCreateFromPathW(path);
+            if (pidl != IntPtr.Zero)
+            {
+                try { if (SHOpenFolderAndSelectItems(pidl, 0, IntPtr.Zero, 0) == 0) return; }
+                finally { ILFree(pidl); }
+            }
+            Process.Start("explorer.exe", "/select,\"" + path + "\"");
         }
 
         // ---------------------------------------------------------- delete
@@ -3593,6 +3670,10 @@ namespace DuplicateFileFinder
             if (toDelete.Count == 0 || busy) return;
             bool verify = chkVerify.Checked;
             bool permanent = chkPermanent.Checked;
+            bool removeEmpty = chkRemoveEmpty.Checked;
+            // The searched folders: those of the last scan and those in the Folders box now
+            var roots = ParseFolders().Select(r => { try { return Path.GetFullPath(r); } catch (Exception) { return r; } })
+                                      .Concat(scanRoots).ToList();
             var inArchives = toDelete.Where(f => f.InArchive).ToList();
             int archiveCount = inArchives.Select(f => f.Archive).Distinct(StringComparer.OrdinalIgnoreCase).Count();
             string question = string.Format(
@@ -3600,7 +3681,7 @@ namespace DuplicateFileFinder
                            : "Send {0:N0} file(s) ({1}) to the Recycle Bin?\r\n\r\n") +
                 "Right before deleting, each file is checked again: it is skipped if it changed or if no unchecked copy of it is found on disk.{2}{3}",
                 toDelete.Count, FormatSize(toDelete.Sum(f => f.Size)),
-                verify ? "\r\nContents are re-compared too (slower)." : "",
+                (verify ? "\r\nContents are re-compared too (slower)." : "") + (removeEmpty ? "\r\nFolders left empty are removed (restoring a file from the Recycle Bin brings its folder back)." : ""),
                 inArchives.Count == 0 ? "" : string.Format(
                     "\r\n\r\n{0:N0} of them are inside {1:N0} archive(s). They are removed from those archives ({2}), and an archive left with no files is deleted.",
                     inArchives.Count, archiveCount,
@@ -3624,9 +3705,10 @@ namespace DuplicateFileFinder
             progress.Maximum = toDelete.Count;
             progress.Value = 0;
             var log = new List<string>();
-            var skipped = new List<string>();
-            int deleted = 0;
+            var skipped = new List<ProblemItem>();
+            int deleted = 0, foldersRemoved = 0;
             long freed = 0;
+            var emptied = new List<string>();   // folders something was deleted from
 
             worker = new BackgroundWorker { WorkerReportsProgress = true, WorkerSupportsCancellation = true };
             Func<string, string> deleteFile = path => permanent ? DeletePermanently(path) : RecycleBin.Delete(path);
@@ -3636,94 +3718,108 @@ namespace DuplicateFileFinder
                 var keepers = new Dictionary<DupGroup, FileEntry>();
                 int step = 0;
 
-                // 1. Ordinary files
-                foreach (var f in toDelete.Where(x => !x.InArchive))
+                try
                 {
-                    if (w.CancellationPending) return;
-                    step++;
-                    w.ReportProgress(step - 1, string.Format("Deleting {0:N0} of {1:N0}   {2}", step, toDelete.Count, f.FullPath));
-                    FileEntry keeper;
-                    string reason = Selection.VerifyBeforeDelete(f, verify, keepers, out keeper);
-                    if (reason == null) reason = deleteFile(f.FullPath);
-                    if (reason == null)
+                    // 1. Ordinary files
+                    foreach (var f in toDelete.Where(x => !x.InArchive))
                     {
-                        f.Deleted = true;
-                        f.Checked = false;
-                        deleted++;
-                        freed += f.Size;
-                        log.Add((permanent ? "DELETED PERMANENTLY\t" : "DELETED (Recycle Bin)\t") + f.FullPath + "\t" + KeptCopyText(keeper));
-                        // A deleted archive takes the files inside it along
-                        MarkArchiveGone(f.FullPath);
-                    }
-                    else
-                    {
-                        skipped.Add(f.FullPath + "  -  " + reason);
-                        log.Add("SKIPPED\t" + f.FullPath + "\t" + reason);
-                    }
-                }
-
-                // 2. Files inside archives: all are verified before any archive changes,
-                //    because changing an archive changes what the checks would see
-                var approved = new List<FileEntry>();
-                var keeperOf = new Dictionary<FileEntry, FileEntry>();
-                var toCheck = toDelete.Where(x => x.InArchive && !x.Deleted).ToList();
-                for (int i = 0; i < toCheck.Count; i++)
-                {
-                    var f = toCheck[i];
-                    if (w.CancellationPending) return;
-                    w.ReportProgress(step, string.Format("Checking the files inside archives before changing them: {0:N0} of {1:N0}", i + 1, toCheck.Count));
-                    FileEntry keeper;
-                    string reason = Selection.VerifyBeforeDelete(f, verify, keepers, out keeper);
-                    if (reason == null) { approved.Add(f); keeperOf[f] = keeper; }
-                    else
-                    {
-                        skipped.Add(f.FullPath + "  -  " + reason);
-                        log.Add("SKIPPED\t" + f.FullPath + "\t" + reason);
-                    }
-                }
-                var byArchive = approved.GroupBy(f => f.Archive, StringComparer.OrdinalIgnoreCase).ToList();
-                int archiveNumber = 0, archiveTotal = byArchive.Count;
-                foreach (var inArchive in byArchive)
-                {
-                    if (w.CancellationPending) return;
-                    // Each archive moves the progress bar by its number of files, in stages
-                    archiveNumber++;
-                    int start = step, units = inArchive.Count();
-                    string name = Path.GetFileName(inArchive.Key);
-                    Action<string, double> stage = (what, fraction) =>
-                        w.ReportProgress(start + (int)(fraction * units),
-                                         string.Format("Archive {0:N0} of {1:N0}: {2} ({3:N0} file(s) to remove) - {4}",
-                                                       archiveNumber, archiveTotal, name, units, what));
-                    var remove = inArchive.ToDictionary(f => f.FullPath.Substring(f.Archive.Length + 1), f => f.Group.Hash,
-                                                        StringComparer.OrdinalIgnoreCase);
-                    bool archiveDeleted;
-                    string reason = ArchiveWriter.RemoveEntries(inArchive.Key, remove, Path.GetTempPath(), deleteFile, out archiveDeleted, stage);
-                    step = start + units;
-                    if (reason != null)
-                    {
-                        foreach (var f in inArchive)
+                        if (w.CancellationPending) return;
+                        step++;
+                        w.ReportProgress(step - 1, string.Format("Deleting {0:N0} of {1:N0}   {2}", step, toDelete.Count, f.FullPath));
+                        FileEntry keeper;
+                        string reason = Selection.VerifyBeforeDelete(f, verify, keepers, out keeper);
+                        if (reason == null) reason = deleteFile(f.FullPath);
+                        if (reason == null)
                         {
-                            skipped.Add(f.FullPath + "  -  " + reason);
+                            f.Deleted = true;
+                            f.Checked = false;
+                            deleted++;
+                            freed += f.Size;
+                            log.Add((permanent ? "DELETED PERMANENTLY\t" : "DELETED (Recycle Bin)\t") + f.FullPath + "\t" + KeptCopyText(keeper));
+                            emptied.Add(Path.GetDirectoryName(f.FullPath));
+                            // A deleted archive takes the files inside it along
+                            MarkArchiveGone(f.FullPath);
+                        }
+                        else
+                        {
+                            skipped.Add(new ProblemItem(reason, f.FullPath, f.FullPath));
                             log.Add("SKIPPED\t" + f.FullPath + "\t" + reason);
                         }
-                        continue;
                     }
-                    foreach (var f in inArchive)
+
+                    // 2. Files inside archives: all are verified before any archive changes,
+                    //    because changing an archive changes what the checks would see
+                    var approved = new List<FileEntry>();
+                    var keeperOf = new Dictionary<FileEntry, FileEntry>();
+                    var toCheck = toDelete.Where(x => x.InArchive && !x.Deleted).ToList();
+                    for (int i = 0; i < toCheck.Count; i++)
                     {
-                        f.Deleted = true;
-                        f.Checked = false;
-                        deleted++;
-                        freed += f.Size;
-                        log.Add("REMOVED FROM ARCHIVE\t" + f.FullPath + "\t" + KeptCopyText(keeperOf[f]));
+                        var f = toCheck[i];
+                        if (w.CancellationPending) return;
+                        w.ReportProgress(step, string.Format("Checking the files inside archives before changing them: {0:N0} of {1:N0}", i + 1, toCheck.Count));
+                        FileEntry keeper;
+                        string reason = Selection.VerifyBeforeDelete(f, verify, keepers, out keeper);
+                        if (reason == null) { approved.Add(f); keeperOf[f] = keeper; }
+                        else
+                        {
+                            skipped.Add(new ProblemItem(reason, f.FullPath, f.Archive));
+                            log.Add("SKIPPED\t" + f.FullPath + "\t" + reason);
+                        }
                     }
-                    if (archiveDeleted)
+                    var byArchive = approved.GroupBy(f => f.Archive, StringComparer.OrdinalIgnoreCase).ToList();
+                    int archiveNumber = 0, archiveTotal = byArchive.Count;
+                    foreach (var inArchive in byArchive)
                     {
-                        log.Add((permanent ? "ARCHIVE DELETED PERMANENTLY (empty)\t" : "ARCHIVE DELETED (empty, Recycle Bin)\t") + inArchive.Key);
-                        MarkArchiveGone(inArchive.Key);
+                        if (w.CancellationPending) return;
+                        // Each archive moves the progress bar by its number of files, in stages
+                        archiveNumber++;
+                        int start = step, units = inArchive.Count();
+                        string name = Path.GetFileName(inArchive.Key);
+                        Action<string, double> stage = (what, fraction) =>
+                            w.ReportProgress(start + (int)(fraction * units),
+                                             string.Format("Archive {0:N0} of {1:N0}: {2} ({3:N0} file(s) to remove) - {4}",
+                                                           archiveNumber, archiveTotal, name, units, what));
+                        var remove = inArchive.ToDictionary(f => f.FullPath.Substring(f.Archive.Length + 1), f => f.Group.Hash,
+                                                            StringComparer.OrdinalIgnoreCase);
+                        bool archiveDeleted;
+                        string reason = ArchiveWriter.RemoveEntries(inArchive.Key, remove, Path.GetTempPath(), deleteFile, out archiveDeleted, stage);
+                        step = start + units;
+                        if (reason != null)
+                        {
+                            foreach (var f in inArchive)
+                            {
+                                skipped.Add(new ProblemItem(reason, f.FullPath, f.Archive));
+                                log.Add("SKIPPED\t" + f.FullPath + "\t" + reason);
+                            }
+                            continue;
+                        }
+                        foreach (var f in inArchive)
+                        {
+                            f.Deleted = true;
+                            f.Checked = false;
+                            deleted++;
+                            freed += f.Size;
+                            log.Add("REMOVED FROM ARCHIVE\t" + f.FullPath + "\t" + KeptCopyText(keeperOf[f]));
+                        }
+                        if (archiveDeleted)
+                        {
+                            log.Add((permanent ? "ARCHIVE DELETED PERMANENTLY (empty)\t" : "ARCHIVE DELETED (empty, Recycle Bin)\t") + inArchive.Key);
+                            emptied.Add(Path.GetDirectoryName(inArchive.Key));
+                            MarkArchiveGone(inArchive.Key);
+                        }
+                        else
+                        {
+                            MarkArchiveChanged(inArchive.Key);
+                        }
                     }
-                    else
+                }
+                finally
+                {
+                    // 3. Folders the deletions left empty (also after Cancel or an error)
+                    if (removeEmpty)
                     {
-                        MarkArchiveChanged(inArchive.Key);
+                        w.ReportProgress(step, "Removing folders left empty...");
+                        foldersRemoved = RemoveEmptyFolders(emptied, roots, log);
                     }
                 }
             };
@@ -3759,18 +3855,52 @@ namespace DuplicateFileFinder
                 msg.AppendFormat(permanent ? "{0:N0} file(s) permanently deleted, {1} freed." : "{0:N0} file(s) sent to the Recycle Bin, {1} freed.",
                                  deleted, FormatSize(freed));
                 if (e.Error != null) msg.Append("\r\n\r\nStopped by an error: " + e.Error.Message);
-                if (skipped.Count > 0)
-                {
-                    msg.AppendFormat("\r\n\r\n{0:N0} file(s) were not deleted:\r\n", skipped.Count);
-                    msg.Append(string.Join("\r\n", skipped.Take(15)));
-                    if (skipped.Count > 15) msg.Append("\r\n...");
-                }
+                if (foldersRemoved > 0) msg.AppendFormat("\r\n{0:N0} empty folder(s) removed.", foldersRemoved);
+                if (skipped.Count > 0) msg.AppendFormat("\r\n\r\n{0:N0} file(s) were not deleted (listed below).", skipped.Count);
                 if (logPath != null) msg.Append("\r\n\r\nA list of what was done is in:\r\n" + logPath);
                 SetStatus(string.Format("{0:N0} file(s) deleted, {1} freed.", deleted, FormatSize(freed)));
-                MessageBox.Show(this, msg.ToString(), Text, MessageBoxButtons.OK,
-                                skipped.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+                if (skipped.Count > 0)
+                    ShowProblems("Some files were not deleted", msg.ToString(), skipped, false);
+                else
+                    MessageBox.Show(this, msg.ToString(), Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
             };
             worker.RunWorkerAsync();
+        }
+
+        // Removes each of these folders that is now empty, then its parent folders while
+        // that leaves them empty too. Only folders strictly inside one of the searched
+        // folders (roots) are removed, never a searched folder itself. Returns how many.
+        static int RemoveEmptyFolders(IEnumerable<string> folders, List<string> roots, List<string> log)
+        {
+            // Inside a searched folder, and not one itself (searched folders can be nested)
+            Func<string, bool> removable = dir =>
+                !roots.Any(r => string.Equals(r.TrimEnd('\\'), dir, StringComparison.OrdinalIgnoreCase)) &&
+                roots.Any(r =>
+                {
+                    string root = r.TrimEnd('\\') + "\\";
+                    return dir.Length > root.Length && dir.StartsWith(root, StringComparison.OrdinalIgnoreCase);
+                });
+            int removed = 0;
+            // Deepest first, so a parent is only looked at after its subfolders
+            foreach (var start in folders.Where(d => d != null).Distinct(StringComparer.OrdinalIgnoreCase).OrderByDescending(d => d.Length))
+            {
+                for (string dir = start.TrimEnd('\\'); dir != null && removable(dir); dir = Path.GetDirectoryName(dir))
+                {
+                    try
+                    {
+                        if (!Directory.Exists(dir) || Directory.EnumerateFileSystemEntries(dir).Any()) break;
+                        Directory.Delete(dir, false);
+                        removed++;
+                        log.Add("FOLDER REMOVED (empty)\t" + dir);
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Add("FOLDER NOT REMOVED\t" + dir + "\t" + ex.Message);
+                        break;
+                    }
+                }
+            }
+            return removed;
         }
 
         static string KeptCopyText(FileEntry keeper)
@@ -3960,6 +4090,87 @@ namespace DuplicateFileFinder
             using (var dlg = new Form { Text = title, Size = new Size(900, 500), StartPosition = FormStartPosition.CenterParent, Font = Font })
             {
                 dlg.Controls.Add(new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Text = text });
+                dlg.ShowDialog(this);
+            }
+        }
+
+        // The items the scan could not read, in a maximized window
+        void ShowErrors()
+        {
+            var items = errors.Select(item =>
+            {
+                // "path: reason" (file names can't contain ':', and a drive's colon is followed by '\')
+                int colon = item.IndexOf(": ", StringComparison.Ordinal);
+                string path = colon < 0 ? item : item.Substring(0, colon);
+                return new ProblemItem(colon < 0 ? "" : item.Substring(colon + 2), path, path);
+            }).ToList();
+            ShowProblems("Items that could not be read", null, items, true);
+        }
+
+        // A table of items and why they failed, under an optional summary with a warning icon.
+        // Clicking a path (or double-clicking a reason) shows the item selected in
+        // Explorer. Ctrl+C copies the selected rows.
+        Bitmap warningImage;   // made once: PictureBox doesn't dispose its image
+
+        void ShowProblems(string title, string summary, List<ProblemItem> items, bool maximized)
+        {
+            using (var dlg = new Form { Text = title, Size = new Size(1000, 560), StartPosition = FormStartPosition.CenterParent,
+                                        Font = Font, MinimizeBox = false, ShowInTaskbar = false })
+            {
+                if (maximized) dlg.WindowState = FormWindowState.Maximized;
+                var grid = new DataGridView
+                {
+                    Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false,
+                    AllowUserToResizeRows = false, RowHeadersVisible = false, SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                    BackgroundColor = SystemColors.Window, BorderStyle = BorderStyle.FixedSingle,
+                    ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText
+                };
+                // A light selection color, as in Explorer: the blue links stay readable on it
+                grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(204, 232, 255);
+                grid.DefaultCellStyle.SelectionForeColor = SystemColors.ControlText;
+                var reasonColumn = new DataGridViewTextBoxColumn { HeaderText = "Reason", MinimumWidth = 120 };
+                grid.Columns.Add(reasonColumn);
+                grid.Columns.Add(new DataGridViewLinkColumn { HeaderText = "Path (click to show it in Explorer)", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+                                                              SortMode = DataGridViewColumnSortMode.Automatic, TrackVisitedState = false });
+                foreach (var item in items)
+                {
+                    int row = grid.Rows.Add(item.Reason, item.Path);
+                    grid.Rows[row].Tag = item.ShowPath;
+                }
+                reasonColumn.AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells;
+                Action<int> show = row =>
+                {
+                    if (row < 0) return;
+                    try { ShowInExplorer((string)grid.Rows[row].Tag); }
+                    catch (Exception ex) { MessageBox.Show(dlg, ex.Message, dlg.Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+                };
+                grid.CellContentClick += (s, e) => { if (e.ColumnIndex == 1) show(e.RowIndex); };
+                // The link column opens on a single click already
+                grid.CellDoubleClick += (s, e) => { if (e.ColumnIndex == 0) show(e.RowIndex); };
+
+                var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(10) };
+                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                if (summary != null)
+                {
+                    var top = new TableLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, ColumnCount = 2, Margin = new Padding(0, 0, 0, 10) };
+                    top.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+                    top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+                    if (warningImage == null) warningImage = SystemIcons.Warning.ToBitmap();
+                    top.Controls.Add(new PictureBox { Image = warningImage, SizeMode = PictureBoxSizeMode.AutoSize,
+                                                      Margin = new Padding(0, 0, 10, 0) }, 0, 0);
+                    // Wraps to the window's width
+                    var text = new Label { Text = summary, AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Right, UseMnemonic = false };
+                    top.Controls.Add(text, 1, 0);
+                    top.SizeChanged += (s, e) => text.MaximumSize = new Size(Math.Max(100, top.Width - 60), 0);
+                    layout.Controls.Add(top, 0, 0);
+                }
+                layout.Controls.Add(grid, 0, 1);
+                var close = new Button { Text = "Close", AutoSize = true, Anchor = AnchorStyles.Right, DialogResult = DialogResult.OK, Margin = new Padding(0, 10, 0, 0) };
+                layout.Controls.Add(close, 0, 2);
+                dlg.Controls.Add(layout);
+                dlg.CancelButton = close;
                 dlg.ShowDialog(this);
             }
         }
