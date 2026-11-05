@@ -21,7 +21,7 @@ using System.Windows.Forms;
 // Without this, .NET treats the program as a 4.0 app and turns off long path support
 [assembly: TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
 [assembly: System.Reflection.AssemblyTitle("Duplicate File Finder")]
-[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
 
 namespace DuplicateFileFinder
 {
@@ -1033,21 +1033,27 @@ namespace DuplicateFileFinder
             }
         }
 
-        // Every file is compared with the disk: missing or changed files (other size
-        // or modified time) are marked Stale and can't be checked. Groups with fewer
-        // than two usable copies are dropped. changed = number of stale files.
-        public static List<DupGroup> Load(string path, out string folders, out int changed)
+        // Reads the file only: comparing every file with the disk is CheckOnDisk, done
+        // afterwards in the background so the list can be shown and used at once.
+        // progress gets the fraction of the file read; returns null if cancelled.
+        public static List<DupGroup> Load(string path, out string folders, Action<double> progress, Func<bool> cancelled)
         {
             folders = "";
-            changed = 0;
             var groups = new List<DupGroup>();
             DupGroup current = null;
-            using (var r = new StreamReader(path, Encoding.UTF8, true))
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16))
+            using (var r = new StreamReader(stream, Encoding.UTF8, true))
             {
                 if (r.ReadLine() != Header) throw new InvalidDataException("This is not a Duplicate File Finder results file.");
                 string line;
+                int lines = 0;
                 while ((line = r.ReadLine()) != null)
                 {
+                    if (++lines % 20000 == 0)
+                    {
+                        if (cancelled()) return null;
+                        progress(stream.Length > 0 ? (double)stream.Position / stream.Length : 0);
+                    }
                     var parts = line.Split('\t');
                     if (parts[0] == "Folders" && parts.Length > 1) folders = parts[1];
                     else if (parts[0] == "G" && parts.Length >= 3)
@@ -1058,7 +1064,7 @@ namespace DuplicateFileFinder
                     }
                     else if (parts[0] == "F" && parts.Length >= 4 && current != null)
                     {
-                        var f = new FileEntry
+                        current.Files.Add(new FileEntry
                         {
                             FullPath = parts[3],
                             Size = current.Size,
@@ -1066,24 +1072,13 @@ namespace DuplicateFileFinder
                             Checked = parts[1] == "1",
                             Modified = new DateTime(long.Parse(parts[2], CultureInfo.InvariantCulture), DateTimeKind.Utc),
                             Group = current
-                        };
-                        var fi = new FileInfo(f.FullPath);
-                        if (!fi.Exists) f.StaleReason = "missing";
-                        else if (fi.Length != f.Size) f.StaleReason = "size changed";
-                        else if (fi.LastWriteTimeUtc.Ticks != f.Modified.Ticks) f.StaleReason = "modified since saved";
-                        if (f.StaleReason != null)
-                        {
-                            f.Stale = true;
-                            f.Checked = false;
-                            changed++;
-                        }
-                        current.Files.Add(f);
+                        });
                     }
                     else if (parts[0] == "A" && parts.Length >= 5 && current != null)
                     {
                         // Older files had no "checked" field
                         int o = parts.Length >= 6 ? 1 : 0;
-                        var f = new FileEntry
+                        current.Files.Add(new FileEntry
                         {
                             FullPath = parts[3 + o] + "\\" + parts[4 + o],
                             Archive = parts[3 + o],
@@ -1093,18 +1088,7 @@ namespace DuplicateFileFinder
                             Modified = new DateTime(long.Parse(parts[1 + o], CultureInfo.InvariantCulture), DateTimeKind.Utc),
                             ArchiveModified = new DateTime(long.Parse(parts[2 + o], CultureInfo.InvariantCulture), DateTimeKind.Utc),
                             Group = current
-                        };
-                        // The archive isn't reopened: an unchanged archive still holds the same file
-                        var ai = new FileInfo(f.Archive);
-                        if (!ai.Exists) f.StaleReason = "archive missing";
-                        else if (ai.LastWriteTimeUtc.Ticks != f.ArchiveModified.Ticks) f.StaleReason = "archive modified since saved";
-                        if (f.StaleReason != null)
-                        {
-                            f.Stale = true;
-                            f.Checked = false;
-                            changed++;
-                        }
-                        current.Files.Add(f);
+                        });
                     }
                 }
             }
@@ -1112,13 +1096,65 @@ namespace DuplicateFileFinder
             foreach (var g in groups)
             {
                 // Never load a group with every copy that must stay checked, unless deleting
-                // every copy was chosen explicitly (and nothing changed since)
+                // every copy was chosen explicitly (if a file turns out changed, that ends too)
                 var mustKeep = Selection.MustKeepOneOf(g);
-                if (g.DeleteAll && g.Files.All(f => !f.Stale) && mustKeep.All(f => f.Checked)) continue;
+                if (g.DeleteAll && mustKeep.All(f => f.Checked)) continue;
                 g.DeleteAll = false;
-                if (mustKeep.All(f => f.Checked)) mustKeep[0].Checked = false;
+                if (mustKeep.Count > 0 && mustKeep.All(f => f.Checked)) mustKeep[0].Checked = false;
             }
             return groups;
+        }
+
+        // What CheckOnDisk already found out: folders that exist or not, and archives
+        public class DiskCache
+        {
+            public readonly Dictionary<string, bool> Folders = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            public readonly Dictionary<string, string> Archives = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        // Why a loaded file can no longer be used (missing, or other size or modified time),
+        // or null if it's unchanged. A missing folder or drive is found once for all the
+        // files in it, and each archive is looked at once for all the files inside it.
+        public static string CheckOnDisk(FileEntry f, DiskCache cache)
+        {
+            try
+            {
+                if (f.InArchive)
+                {
+                    // The archive isn't reopened: an unchanged archive still holds the same file
+                    string reason;
+                    if (!cache.Archives.TryGetValue(f.Archive, out reason))
+                    {
+                        var ai = new FileInfo(f.Archive);
+                        if (!FolderExists(Path.GetDirectoryName(f.Archive), cache) || !ai.Exists) reason = "archive missing";
+                        else if (ai.LastWriteTimeUtc.Ticks != f.ArchiveModified.Ticks) reason = "archive modified since saved";
+                        cache.Archives[f.Archive] = reason;
+                    }
+                    return reason;
+                }
+                if (!FolderExists(Path.GetDirectoryName(f.FullPath), cache)) return "missing";
+                var fi = new FileInfo(f.FullPath);
+                if (!fi.Exists) return "missing";
+                if (fi.Length != f.Size) return "size changed";
+                if (fi.LastWriteTimeUtc.Ticks != f.Modified.Ticks) return "modified since saved";
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return "could not be checked: " + ex.Message;
+            }
+        }
+
+        // A folder whose parent is missing is missing too, without asking the disk again
+        static bool FolderExists(string folder, DiskCache cache)
+        {
+            if (string.IsNullOrEmpty(folder)) return true;
+            bool exists;
+            if (cache.Folders.TryGetValue(folder, out exists)) return exists;
+            string parent = Path.GetDirectoryName(folder);
+            exists = (parent == null || FolderExists(parent, cache)) && Directory.Exists(folder);
+            cache.Folders[folder] = exists;
+            return exists;
         }
     }
 
@@ -1996,7 +2032,13 @@ namespace DuplicateFileFinder
             cboSort.SelectedIndex = 0;
             tools.Items.Add(cboSort);
             tools.Items.Add(new ToolStripSeparator());
-            tools.Items.Add(new ToolStripButton("Expand all", null, (s, e) => { tree.BeginUpdate(); tree.ExpandAll(); tree.EndUpdate(); }));
+            tools.Items.Add(new ToolStripButton("Expand all", null, (s, e) =>
+            {
+                if (TooManyToExpand(shownGroups.Sum(g => g.Files.Count))) return;
+                tree.BeginUpdate();
+                tree.ExpandAll();
+                tree.EndUpdate();
+            }));
             tools.Items.Add(new ToolStripButton("Collapse all", null, (s, e) => { tree.BeginUpdate(); tree.CollapseAll(); tree.EndUpdate(); }));
             tools.Items.Add(new ToolStripSeparator());
             tools.Items.Add(new ToolStripButton("Save results...", null, (s, e) => SaveResults()) { ToolTipText = "Save the results and checkmarks to continue later (Ctrl+S)" });
@@ -2109,25 +2151,15 @@ namespace DuplicateFileFinder
 
             // Built when it opens, for the file clicked
             fileMenu = new ContextMenuStrip();
-            fileMenu.Opening += (s, e) =>
-            {
-                // Dispose the previous items: their submenus are windows, which would
-                // otherwise never be destroyed (a few window handles lost per right-click)
-                var old = fileMenu.Items.Cast<ToolStripItem>().ToList();
-                fileMenu.Items.Clear();
-                foreach (var item in old) item.Dispose();
-                var f = SelectedFile();
-                if (f == null) { e.Cancel = true; return; }
-                fileMenu.Items.AddRange(FileMenuItems(f, true));
-                ShowAccessKeys(fileMenu);
-                e.Cancel = false;
-            };
+            fileMenu.Opening += (s, e) => e.Cancel = !FillFileMenu();
             groupMenu = new ContextMenuStrip();
             groupMenu.Items.Add("&Keep the first copy, check the others", null, (s, e) => KeepFirstInSelectedGroup());
             groupMenu.Items.Add("&Uncheck this group", null, (s, e) => UncheckSelectedGroup());
             folderMenu = new ContextMenuStrip();
             folderMenu.Items.Add("&Check all duplicates in this folder", null, (s, e) => SetNodeChecked(tree.SelectedNode, true));
             folderMenu.Items.Add("&Uncheck all duplicates in this folder", null, (s, e) => SetNodeChecked(tree.SelectedNode, false));
+            folderMenu.Items.Add("&Keep the copies in this folder (check all others)", null, (s, e) => KeepInFolder(tree.SelectedNode, false));
+            folderMenu.Items.Add("Keep the copies in this folder and its &subfolders (check all others)", null, (s, e) => KeepInFolder(tree.SelectedNode, true));
             folderMenu.Items.Add(new ToolStripSeparator());
             var folderAuto = new ToolStripMenuItem("&Auto-select inside this folder");
             folderAuto.ToolTipText = "For each file with several copies in this folder and its subfolders, keep one of them and check the others. Copies elsewhere are not changed.";
@@ -2139,7 +2171,14 @@ namespace DuplicateFileFinder
             folderMenu.Items.Add(folderAuto);
             folderMenu.Items.Add(new ToolStripSeparator());
             folderMenu.Items.Add("&Open folder", null, (s, e) => OpenFolder(tree.SelectedNode));
-            folderMenu.Items.Add("&Expand everything below", null, (s, e) => { if (tree.SelectedNode != null) tree.SelectedNode.ExpandAll(); });
+            folderMenu.Items.Add("&Expand everything below", null, (s, e) =>
+            {
+                var node = tree.SelectedNode;
+                if (node == null || TooManyToExpand(FilesUnder(node).Count)) return;
+                tree.BeginUpdate();
+                node.ExpandAll();
+                tree.EndUpdate();
+            });
             ShowAccessKeys(groupMenu);
             ShowAccessKeys(folderMenu);
 
@@ -2163,6 +2202,12 @@ namespace DuplicateFileFinder
             cboView.SelectedIndexChanged += (s, e) => { cboSort.Enabled = cboView.SelectedIndex == 1; BuildTree(); };
             cboSort.Enabled = false;
             tree.AfterSelect += (s, e) => ShowPreview(e.Node);
+            tree.BeforeExpand += (s, e) => RealizeChildren(e.Node);
+            tree.NodeMouseHover += (s, e) =>
+            {
+                var file = e.Node.Tag as FileEntry;
+                if (file != null && string.IsNullOrEmpty(e.Node.ToolTipText)) e.Node.ToolTipText = FileTip(file);
+            };
             tree.NodeMouseClick += Tree_NodeMouseClick;
             tree.NodeMouseDoubleClick += (s, e) =>
             {
@@ -2177,6 +2222,20 @@ namespace DuplicateFileFinder
                 {
                     ToggleNode(tree.SelectedNode);
                     e.Handled = e.SuppressKeyPress = true;
+                }
+                // Letters and digits never move the selection (the tree would jump to the next
+                // item starting with them): a menu letter runs its item, the others do nothing
+                bool letter = e.KeyCode >= Keys.A && e.KeyCode <= Keys.Z;
+                bool digit = (e.KeyCode >= Keys.D0 && e.KeyCode <= Keys.D9) || (e.KeyCode >= Keys.NumPad0 && e.KeyCode <= Keys.NumPad9);
+                if ((letter || digit) && (e.Modifiers == Keys.None || e.Modifiers == Keys.Shift))
+                {
+                    e.Handled = e.SuppressKeyPress = true;
+                    // Run after this key is done: an item that asks first (a message box) would
+                    // otherwise let the typed letter reach the tree, which then jumped
+                    var node = tree.SelectedNode;
+                    char key = (char)e.KeyCode;
+                    if (letter && e.Modifiers == Keys.None && node != null && !busy)
+                        BeginInvoke(new Action(() => { if (!busy && tree.SelectedNode == node) RunMenuKey(node, key); }));
                 }
             };
             lblErrors.Click += (s, e) => ShowErrors();
@@ -2206,10 +2265,12 @@ namespace DuplicateFileFinder
                 // Results carried over by RestartProgram: load them as they were, then
                 // remove the temporary file (and keep the "re-compare" choice as it was)
                 bool recompare = chkVerify.Checked;
-                LoadResults(results);
-                chkVerify.Checked = recompare;
-                try { File.Delete(results); } catch (Exception) { }
-                SetStatus("Duplicate File Finder restarted; your results and checkmarks were kept.");
+                LoadResults(results, () =>
+                {
+                    chkVerify.Checked = recompare;
+                    try { File.Delete(results); } catch (Exception) { }
+                    SetStatus("Duplicate File Finder restarted; your results and checkmarks were kept.");
+                });
             }
             else if (results != null) LoadResults(results);
             else if (folders.Count > 0)
@@ -2398,6 +2459,7 @@ namespace DuplicateFileFinder
                 return;
             }
             if (worker != null) worker.CancelAsync();
+            diskCheckGeneration++;
             if (saveTimer != null) saveTimer.Stop();
             SaveSettings();
             CloseRichPreview();
@@ -2479,6 +2541,7 @@ namespace DuplicateFileFinder
         // Back to the starting state: no results, no preview, no list of unreadable items
         void ClearResults()
         {
+            StopDiskCheck();
             groups = new List<DupGroup>();
             errors.Clear();
             ShowErrorsLink();
@@ -2539,6 +2602,7 @@ namespace DuplicateFileFinder
                 IncludeArchives = chkArchives.Checked
             };
             roots = roots.Select(Path.GetFullPath).ToList();
+            StopDiskCheck();
             scanRoots = roots;
             groups = new List<DupGroup>();
             errors.Clear();
@@ -2598,7 +2662,7 @@ namespace DuplicateFileFinder
             btnScan.Enabled = !value;
             btnAddFolder.Enabled = !value;
             btnFolderList.Enabled = !value;
-            btnDelete.Enabled = !value;
+            btnDelete.Enabled = !value && !checkingDisk;
             tools.Enabled = !value;
             tree.Enabled = !value;
             txtFolders.Enabled = !value;
@@ -2617,11 +2681,17 @@ namespace DuplicateFileFinder
 
         void BuildTree()
         {
-            string filter = txtFilter.Text.Trim();
+            ShowTree(PrepareTree(txtFilter.Text.Trim(), cboSort.SelectedIndex, cboView.SelectedIndex == 1, null));
+        }
+
+        // Makes the tree items for the results. It doesn't touch the window, so loading runs it
+        // in the background (the window keeps drawing and shows progress, 0 to 1).
+        List<TreeNode> PrepareTree(string filter, int sort, bool groupView, Action<double> progress)
+        {
             IEnumerable<DupGroup> shown = groups.Where(g => g.Valid.Count > 1);
             if (filter.Length > 0)
                 shown = shown.Where(g => g.Files.Any(f => f.FullPath.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0));
-            switch (cboSort.SelectedIndex)
+            switch (sort)
             {
                 case 1: shown = shown.OrderByDescending(g => g.Valid.Count).ThenByDescending(g => g.Wasted); break;
                 case 2: shown = shown.OrderBy(g => g.Files[0].Name, StringComparer.CurrentCultureIgnoreCase); break;
@@ -2635,14 +2705,50 @@ namespace DuplicateFileFinder
                 g.Node = null;
                 foreach (var f in g.Files) f.Node = null;
             }
-            var nodes = cboView.SelectedIndex == 1 ? BuildGroupNodes() : BuildFolderNodes();
+            pendingChildren.Clear();
+            pendingParent.Clear();
+            int files = shownGroups.Sum(g => g.Files.Count);
+            lazyTree = files > ExpandAllLimit;
+            fileText = groupView ? (Func<FileEntry, string>)FileText : FolderFileText;
+            // The folder view goes through the files twice (folders, then tree items)
+            buildProgress = progress;
+            buildDone = 0;
+            buildTotal = Math.Max(1, groupView ? files : 2 * files);
+            buildNextReport = 0;
+            try
+            {
+                return groupView ? BuildGroupNodes() : BuildFolderNodes();
+            }
+            finally
+            {
+                buildProgress = null;
+            }
+        }
 
+        Action<double> buildProgress;
+        int buildDone, buildTotal, buildNextReport;
+
+        void BuildStep(int files)
+        {
+            if (buildProgress == null) return;
+            buildDone += files;
+            if (buildDone < buildNextReport) return;
+            buildNextReport = buildDone + 2000;
+            buildProgress(Math.Min(1.0, (double)buildDone / buildTotal));
+        }
+
+        void ShowTree(List<TreeNode> nodes)
+        {
             tree.BeginUpdate();
             try
             {
                 tree.Nodes.Clear();
                 tree.Nodes.AddRange(nodes.ToArray());
-                tree.ExpandAll();
+                // Large results start collapsed (items are made as folders are opened), except
+                // the drives or top folders of the folder view. In the group view the top items
+                // are the groups, so they stay closed.
+                if (!lazyTree) tree.ExpandAll();
+                else foreach (var n in nodes.Where(x => x.Tag is FolderTag)) n.Expand();
             }
             finally
             {
@@ -2660,30 +2766,110 @@ namespace DuplicateFileFinder
             foreach (var g in shownGroups)
             {
                 var gn = new TreeNode(GroupText(g)) { Tag = g };
-                foreach (var f in g.Files)
-                    if (!f.Deleted) gn.Nodes.Add(MakeFileNode(f, FileText(f)));
+                SetChildren(gn, g.Files.Where(f => !f.Deleted).Select(MakeFileNode).ToList());
                 g.Node = gn;
                 nodes.Add(gn);
+                BuildStep(g.Files.Count);
             }
             return nodes;
         }
 
-        TreeNode MakeFileNode(FileEntry f, string text)
+        // The text of a file line in the current view (set by BuildTree)
+        Func<FileEntry, string> fileText = FolderFileText;
+
+        TreeNode MakeFileNode(FileEntry f)
         {
-            var others = f.Group.Files.Where(x => x != f && !x.Deleted).Select(x => x.FullPath).ToList();
-            string tip = f.FullPath + "\r\n\r\nOther copies:\r\n  " + string.Join("\r\n  ", others.Take(10)) +
-                         (others.Count > 10 ? "\r\n  ..." : "");
-            // No NodeFont: the tree draws files in the regular font itself (see Tree_DrawNode)
-            var node = new TreeNode(text) { Tag = f, ToolTipText = tip };
+            // No NodeFont: the tree draws files in the regular font itself (see Tree_DrawNode).
+            // No text and no tooltip yet: the text is set when the line is shown (UpdateNode),
+            // the tooltip when the mouse rests on it (FileTip). Making them for every file
+            // took most of the time and memory with large results.
+            var node = new TreeNode("") { Tag = f };
             f.Node = node;
             return node;
+        }
+
+        static string FileTip(FileEntry f)
+        {
+            var others = f.Group.Files.Where(x => x != f && !x.Deleted).Select(x => x.FullPath).ToList();
+            return f.FullPath + "\r\n\r\nOther copies:\r\n  " + string.Join("\r\n  ", others.Take(10)) +
+                   (others.Count > 10 ? "\r\n  ..." : "");
+        }
+
+        // Large results: a node's children become tree items only when it's first expanded
+        // (adding hundreds of thousands of items took minutes and gigabytes). Until then they
+        // wait in pendingChildren, and the node holds one empty placeholder so it shows a [+].
+        // Code that goes through the tree uses ChildrenOf, which sees them either way.
+        readonly Dictionary<TreeNode, TreeNode[]> pendingChildren = new Dictionary<TreeNode, TreeNode[]>();
+        readonly Dictionary<TreeNode, TreeNode> pendingParent = new Dictionary<TreeNode, TreeNode>();
+        const int ExpandAllLimit = 20000;   // files: up to this many, the whole tree is built and expanded at once
+        bool lazyTree;
+
+        void SetChildren(TreeNode node, List<TreeNode> children)
+        {
+            if (!lazyTree || children.Count == 0) { node.Nodes.AddRange(children.ToArray()); return; }
+            var list = children.ToArray();
+            pendingChildren[node] = list;
+            foreach (var child in list) pendingParent[child] = node;
+            node.Nodes.Add(new TreeNode());
+        }
+
+        IEnumerable<TreeNode> ChildrenOf(TreeNode node)
+        {
+            TreeNode[] pending;
+            return pendingChildren.TryGetValue(node, out pending) ? pending : node.Nodes.Cast<TreeNode>();
+        }
+
+        // Before a node expands: its waiting children become tree items
+        void RealizeChildren(TreeNode node)
+        {
+            TreeNode[] pending;
+            if (!pendingChildren.TryGetValue(node, out pending)) return;
+            pendingChildren.Remove(node);
+            foreach (var child in pending) pendingParent.Remove(child);
+            // Their look is set before they're added (cheap while they aren't tree items yet),
+            // and they're added in one go: one by one, the tree redraws for each
+            foreach (var child in pending) UpdateNode(child, true);
+            tree.BeginUpdate();
+            try
+            {
+                node.Nodes.Clear();
+                node.Nodes.AddRange(pending);
+            }
+            finally
+            {
+                tree.EndUpdate();
+            }
+        }
+
+        // Expands the nodes above this one, so it can be selected or scrolled to
+        void Reveal(TreeNode node)
+        {
+            var chain = new Stack<TreeNode>();
+            for (var p = ParentOf(node); p != null; p = ParentOf(p)) chain.Push(p);
+            while (chain.Count > 0) chain.Pop().Expand();
+        }
+
+        TreeNode ParentOf(TreeNode node)
+        {
+            TreeNode parent;
+            return node.Parent ?? (pendingParent.TryGetValue(node, out parent) ? parent : null);
+        }
+
+        // "Expand all" on hundreds of thousands of files would make every one a tree item
+        bool TooManyToExpand(int files)
+        {
+            if (files <= ExpandAllLimit) return false;
+            SetStatus(string.Format("{0:N0} files are too many to expand everything at once: open the folders you need, or narrow the list with Filter.", files));
+            return true;
         }
 
         // A folder of the folder view, before it becomes a tree node
         class DirEntry
         {
             public string Name, FullPath;
-            public SortedDictionary<string, DirEntry> Subs = new SortedDictionary<string, DirEntry>(StringComparer.CurrentCultureIgnoreCase);
+            // Sorted only when the node is made: sorting on every lookup (by culture) took
+            // most of the time with hundreds of thousands of files
+            public Dictionary<string, DirEntry> Subs = new Dictionary<string, DirEntry>(StringComparer.OrdinalIgnoreCase);
             public List<FileEntry> Files = new List<FileEntry>();
         }
 
@@ -2695,31 +2881,45 @@ namespace DuplicateFileFinder
             // Files inside an archive appear under it, as if the archive were a folder
             archivePaths = new HashSet<string>(shownGroups.SelectMany(g => g.Files).Where(x => x.InArchive).Select(x => x.Archive),
                                                StringComparer.OrdinalIgnoreCase);
-            var roots = new SortedDictionary<string, DirEntry>(StringComparer.CurrentCultureIgnoreCase);
+            var roots = new Dictionary<string, DirEntry>(StringComparer.OrdinalIgnoreCase);
+            var byPath = new Dictionary<string, DirEntry>(StringComparer.OrdinalIgnoreCase);
             foreach (var f in shownGroups.SelectMany(g => g.Files).Where(x => !x.Deleted))
             {
                 string dir = Path.GetDirectoryName(f.FullPath);
-                string root = Path.GetPathRoot(dir);    // "D:\" or "\\server\share"
                 DirEntry d;
-                if (!roots.TryGetValue(root, out d))
+                if (!byPath.TryGetValue(dir, out d))
                 {
-                    d = new DirEntry { Name = root, FullPath = root };
-                    roots.Add(root, d);
-                }
-                foreach (string part in dir.Substring(root.Length).Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    DirEntry sub;
-                    if (!d.Subs.TryGetValue(part, out sub))
+                    string root = Path.GetPathRoot(dir);    // "D:\" or "\\server\share"
+                    if (!roots.TryGetValue(root, out d))
                     {
-                        sub = new DirEntry { Name = part, FullPath = Path.Combine(d.FullPath, part) };
-                        d.Subs.Add(part, sub);
+                        d = new DirEntry { Name = root, FullPath = root };
+                        roots.Add(root, d);
                     }
-                    d = sub;
+                    foreach (string part in dir.Substring(root.Length).Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        DirEntry sub;
+                        if (!d.Subs.TryGetValue(part, out sub))
+                        {
+                            sub = new DirEntry { Name = part, FullPath = Path.Combine(d.FullPath, part) };
+                            d.Subs.Add(part, sub);
+                        }
+                        d = sub;
+                    }
+                    byPath[dir] = d;
                 }
                 d.Files.Add(f);
+                BuildStep(1);
             }
-            return roots.Values.Select(MakeFolderNode).ToList();
+            return roots.Values.OrderBy(x => NameKey(x.Name), SortKeyOrder).Select(MakeFolderNode).ToList();
         }
+
+        // Names in the user's language order, ignoring case (as StringComparer.CurrentCultureIgnoreCase)
+        static SortKey NameKey(string name)
+        {
+            return CultureInfo.CurrentCulture.CompareInfo.GetSortKey(name, CompareOptions.IgnoreCase);
+        }
+
+        static readonly IComparer<SortKey> SortKeyOrder = Comparer<SortKey>.Create(SortKey.Compare);
 
         TreeNode MakeFolderNode(DirEntry d)
         {
@@ -2733,9 +2933,10 @@ namespace DuplicateFileFinder
             }
             var tag = new FolderTag { FullPath = d.FullPath, Name = name, IsArchive = archivePaths.Contains(d.FullPath) };
             var node = new TreeNode(name) { Tag = tag, ToolTipText = d.FullPath };
-            foreach (var sub in d.Subs.Values) node.Nodes.Add(MakeFolderNode(sub));
-            foreach (var f in d.Files.OrderBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase))
-                node.Nodes.Add(MakeFileNode(f, FolderFileText(f)));
+            var children = d.Subs.Values.OrderBy(x => NameKey(x.Name), SortKeyOrder).Select(MakeFolderNode).ToList();
+            children.AddRange(d.Files.OrderBy(x => NameKey(x.Name), SortKeyOrder).Select(MakeFileNode));
+            SetChildren(node, children);
+            BuildStep(d.Files.Count);
             return node;
         }
 
@@ -2777,11 +2978,18 @@ namespace DuplicateFileFinder
         {
             if (f.Node == null) return;
             Color color;
-            var mustKeep = Selection.MustKeepOneOf(f.Group);
+            // Every usable copy is one that could be kept (MustKeepOneOf); counted here without
+            // building lists, as this runs for every file on every click
+            int usable = 0, usableChecked = 0;
+            foreach (var x in f.Group.Files)
+                if (!x.Stale && !x.Deleted)
+                {
+                    usable++;
+                    if (x.Checked) usableChecked++;
+                }
             if (f.Stale) color = SystemColors.GrayText;
             else if (f.Checked) color = Color.Firebrick;
-            else if (mustKeep.Contains(f) && mustKeep.Where(x => x != f).All(x => x.Checked) &&
-                     f.Group.Valid.Any(x => x != f && x.Checked)) color = Color.ForestGreen;
+            else if (!f.Deleted && usableChecked > 0 && usableChecked == usable - 1) color = Color.ForestGreen;
             else if (f.InArchive) color = Color.SteelBlue;
             else color = SystemColors.WindowText;
             if (f.Node.ForeColor != color) f.Node.ForeColor = color;
@@ -2816,11 +3024,10 @@ namespace DuplicateFileFinder
             }
             if (e.Button != MouseButtons.Right) return;
             tree.SelectedNode = e.Node;
-            var menu = e.Node.Tag is FileEntry ? fileMenu : e.Node.Tag is FolderTag ? folderMenu : groupMenu;
-            menu.Show(tree, e.Location);
+            MenuFor(e.Node).Show(tree, e.Location);
         }
 
-        static List<FileEntry> FilesUnder(TreeNode node)
+        List<FileEntry> FilesUnder(TreeNode node)
         {
             var list = new List<FileEntry>();
             if (node == null) return list;
@@ -2831,7 +3038,7 @@ namespace DuplicateFileFinder
                 var n = stack.Pop();
                 var f = n.Tag as FileEntry;
                 if (f != null && !f.Stale && !f.Deleted) list.Add(f);
-                foreach (TreeNode child in n.Nodes) stack.Push(child);
+                foreach (var child in ChildrenOf(n)) stack.Push(child);
             }
             return list;
         }
@@ -2917,26 +3124,42 @@ namespace DuplicateFileFinder
                 tree.EndUpdate();
             }
             UpdateTotals();
+            RefreshInfo();
         }
 
         // Returns how many usable files are below node, and how many of them are checked
         int[] UpdateNode(TreeNode node)
         {
+            return UpdateNode(node, true);
+        }
+
+        // shown = false: node is among children not expanded yet (pendingChildren). Only its
+        // counts are needed then; its look is set when it becomes a tree item.
+        int[] UpdateNode(TreeNode node, bool shown)
+        {
             // Counts: [0] files that can be checked, [1] checked
             var f = node.Tag as FileEntry;
             if (f != null)
             {
-                DupTree.SetState(node, f.Stale ? DupTree.Disabled : f.Checked ? DupTree.Checked : DupTree.Unchecked);
-                StyleNode(f);
+                if (shown)
+                {
+                    DupTree.SetState(node, f.Stale ? DupTree.Disabled : f.Checked ? DupTree.Checked : DupTree.Unchecked);
+                    string text = fileText(f);
+                    if (node.Text != text) node.Text = text;
+                    StyleNode(f);
+                }
                 return new[] { f.Stale ? 0 : 1, !f.Stale && f.Checked ? 1 : 0 };
             }
             int total = 0, chk = 0;
-            foreach (TreeNode child in node.Nodes)
+            TreeNode[] pending;
+            bool childrenShown = shown && !pendingChildren.TryGetValue(node, out pending);
+            foreach (var child in ChildrenOf(node))
             {
-                var r = UpdateNode(child);
+                var r = UpdateNode(child, childrenShown);
                 total += r[0];
                 chk += r[1];
             }
+            if (!shown) return new[] { total, chk };
             DupTree.SetState(node, total == 0 ? DupTree.Disabled
                                  : chk == 0 ? DupTree.Unchecked
                                  : chk == total ? DupTree.Checked : DupTree.Mixed);
@@ -3012,6 +3235,69 @@ namespace DuplicateFileFinder
             return items.ToArray();
         }
 
+        // Puts the items for the selected file in fileMenu (false: no file is selected)
+        bool FillFileMenu()
+        {
+            // Dispose the previous items: their submenus are windows, which would
+            // otherwise never be destroyed (a few window handles lost per right-click)
+            var old = fileMenu.Items.Cast<ToolStripItem>().ToList();
+            fileMenu.Items.Clear();
+            foreach (var item in old) item.Dispose();
+            var f = SelectedFile();
+            if (f == null) return false;
+            fileMenu.Items.AddRange(FileMenuItems(f, true));
+            ShowAccessKeys(fileMenu);
+            return true;
+        }
+
+        ContextMenuStrip MenuFor(TreeNode node)
+        {
+            return node.Tag is FileEntry ? fileMenu : node.Tag is FolderTag ? folderMenu : groupMenu;
+        }
+
+        // A letter key on the selected tree item runs its right-click menu item with that
+        // underlined letter (O opens a file), without opening the menu. An item with a submenu
+        // opens the menu there, with that submenu open. False: no item has the letter.
+        bool RunMenuKey(TreeNode node, char key)
+        {
+            var menu = MenuFor(node);
+            if (menu == fileMenu && !FillFileMenu()) return false;
+            var item = MenuItemFor(menu, key);
+            if (item == null) return false;
+            if (!item.HasDropDownItems)
+            {
+                item.PerformClick();
+                return true;
+            }
+            var bounds = node.Bounds;
+            menu.Show(tree, new Point(bounds.Left + 16, bounds.Bottom));
+            // Opening the file menu makes its items again
+            item = MenuItemFor(menu, key);
+            if (item != null)
+            {
+                item.Select();
+                item.ShowDropDown();
+            }
+            return true;
+        }
+
+        static ToolStripMenuItem MenuItemFor(ToolStrip menu, char key)
+        {
+            return menu.Items.OfType<ToolStripMenuItem>().FirstOrDefault(i => i.Enabled && AccessKey(i.Text) == key);
+        }
+
+        // The letter after a single '&' ("&&" is a '&' shown as is)
+        static char AccessKey(string text)
+        {
+            for (int i = 0; i < text.Length - 1; i++)
+            {
+                if (text[i] != '&') continue;
+                if (text[i + 1] != '&') return char.ToUpperInvariant(text[i + 1]);
+                i++;
+            }
+            return '\0';
+        }
+
         // Underlines each item's shortcut letter (pressing it while the menu is open runs the
         // item). Windows hides the underlines when a menu is opened with the mouse.
         static readonly ToolStripRenderer accessKeyRenderer = new AccessKeyRenderer();
@@ -3055,6 +3341,7 @@ namespace DuplicateFileFinder
         void JumpTo(FileEntry f)
         {
             if (f.Node == null) return;
+            Reveal(f.Node);
             f.Node.EnsureVisible();
             tree.SelectedNode = f.Node;
             tree.Focus();
@@ -3081,7 +3368,7 @@ namespace DuplicateFileFinder
                 ? string.Format("{0:N0} groups of duplicates   \u2022   {1} could be freed   \u2022   nothing checked yet",
                                 groups.Count(g => g.Valid.Count > 1), FormatSize(groups.Sum(g => g.Wasted)))
                 : string.Format("Checked: {0:N0} file(s), {1} will be freed", chk.Count, FormatSize(bytes));
-            btnDelete.Enabled = !busy && chk.Count > 0;
+            btnDelete.Enabled = !busy && !checkingDisk && chk.Count > 0;
         }
 
         FileEntry SelectedFile()
@@ -3133,6 +3420,29 @@ namespace DuplicateFileFinder
             SetStatus(msg);
         }
 
+        // Every file with a copy in this folder (or below it) keeps the copies here; its
+        // copies elsewhere are checked
+        void KeepInFolder(TreeNode node, bool subfolders)
+        {
+            if (busy || node == null) return;
+            var inside = new HashSet<FileEntry>(subfolders ? FilesUnder(node)
+                : ChildrenOf(node).Select(n => n.Tag as FileEntry).Where(x => x != null && !x.Stale && !x.Deleted));
+            int checkedCount = 0;
+            var groupsHere = inside.Select(x => x.Group).Distinct().ToList();
+            foreach (var g in groupsHere)
+                foreach (var x in g.Valid)
+                {
+                    x.Checked = !inside.Contains(x);
+                    if (x.Checked) checkedCount++;
+                }
+            RefreshStates();
+            string where = NodeName(node) + (subfolders ? " and its subfolders" : "");
+            SetStatus(inside.Count == 0
+                ? "There are no duplicate files directly in " + where + ", so nothing was changed." +
+                  (subfolders ? "" : " (To include its subfolders, use \"Keep the copies in this folder and its subfolders\".)")
+                : string.Format("Kept the {0:N0} copies in {1}; checked {2:N0} other copies of them elsewhere.", inside.Count, where, checkedCount));
+        }
+
         void KeepOnly(FileEntry f)
         {
             if (busy || f == null || f.Stale) return;
@@ -3182,20 +3492,42 @@ namespace DuplicateFileFinder
             var folder = node == null ? null : node.Tag as FolderTag;
             btnOpen.Enabled = f != null;
             btnShowFolder.Enabled = f != null || folder != null;
+            infoBase = NodeInfo(node);
+            txtInfo.Text = infoBase;
+            if (f == null)
+            {
+                lblNoPreview.Text = "Click a file to preview it.";
+                return;
+            }
+            AutoSizeInfo();
+            if (f.InArchive)
+            {
+                PreviewFromArchive(f);
+                return;
+            }
+            ShowFileContent(f.FullPath, f.Size);
+        }
+
+        // The details shown above the preview, before any notes added to them (archive copy,
+        // thumbnail): kept so RefreshInfo can update them and leave the notes
+        string infoBase = "";
+
+        string NodeInfo(TreeNode node)
+        {
+            var f = node == null ? null : node.Tag as FileEntry;
             if (f == null)
             {
                 var g = node == null ? null : node.Tag as DupGroup;
+                var folder = node == null ? null : node.Tag as FolderTag;
                 if (g != null)
-                    txtInfo.Text = string.Format("{0} identical copies of {1:N0} bytes each.\r\nSHA-256: {2}", g.Valid.Count, g.Size, g.Hash);
-                else if (folder != null)
+                    return string.Format("{0} identical copies of {1:N0} bytes each.\r\nSHA-256: {2}", g.Valid.Count, g.Size, g.Hash);
+                if (folder != null)
                 {
                     var below = FilesUnder(node);
-                    txtInfo.Text = string.Format("{0}\r\n{1:N0} duplicate file(s) in this folder and its subfolders ({2}), {3:N0} checked.",
-                                                 folder.FullPath, below.Count, FormatSize(below.Sum(x => x.Size)), below.Count(x => x.Checked));
+                    return string.Format("{0}\r\n{1:N0} duplicate file(s) in this folder and its subfolders ({2}), {3:N0} checked.",
+                                         folder.FullPath, below.Count, FormatSize(below.Sum(x => x.Size)), below.Count(x => x.Checked));
                 }
-                else txtInfo.Text = "";
-                lblNoPreview.Text = "Click a file to preview it.";
-                return;
+                return "";
             }
 
             var info = new StringBuilder();
@@ -3210,14 +3542,17 @@ namespace DuplicateFileFinder
                 string mark = c.Stale ? "[changed] " : c.Checked ? "[delete]  " : "[keep]    ";
                 info.Append("\r\n" + mark + c.FullPath + (c.InArchive ? "   (inside archive)" : "") + (c == f ? "   <- this one" : ""));
             }
-            txtInfo.Text = info.ToString();
-            AutoSizeInfo();
-            if (f.InArchive)
-            {
-                PreviewFromArchive(f);
-                return;
-            }
-            ShowFileContent(f.FullPath, f.Size);
+            return info.ToString();
+        }
+
+        // After checkmarks change: the details of the selected item follow ([keep] / [delete],
+        // folder counts), without previewing the file again
+        void RefreshInfo()
+        {
+            string now = NodeInfo(tree.SelectedNode);
+            if (now == infoBase || !txtInfo.Text.StartsWith(infoBase, StringComparison.Ordinal)) return;
+            txtInfo.Text = now + txtInfo.Text.Substring(infoBase.Length);
+            infoBase = now;
         }
 
         // ------------------------------------------- previewing inside archives
@@ -3668,6 +4003,7 @@ namespace DuplicateFileFinder
         {
             var toDelete = CheckedFiles();
             if (toDelete.Count == 0 || busy) return;
+            if (checkingDisk) { SetStatus("Deleting waits until the loaded files have been checked on disk."); return; }
             bool verify = chkVerify.Checked;
             bool permanent = chkPermanent.Checked;
             bool removeEmpty = chkRemoveEmpty.Checked;
@@ -4011,34 +4347,223 @@ namespace DuplicateFileFinder
 
         void LoadResults(string path)
         {
+            LoadResults(path, null);
+        }
+
+        // Reads the file in the background with progress (Cancel keeps the current results),
+        // shows the list as soon as it's read, then compares the files with the disk in the
+        // background (CheckLoadedFiles): the list can be used meanwhile, only deleting waits.
+        // afterLoad runs when all is done.
+        void LoadResults(string path, Action afterLoad)
+        {
             if (busy) return;
             if (CheckedFiles().Count > 0 &&
                 MessageBox.Show(this, "Loading discards the current results and checkmarks. Continue?", Text,
                                 MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-            Cursor = Cursors.WaitCursor;
-            try
+            StopDiskCheck();
+            string name = Path.GetFileName(path);
+            SetBusy(true);
+            btnCancel.Enabled = true;
+            progress.Style = ProgressBarStyle.Continuous;
+            progress.Maximum = 1000;
+            progress.Value = 0;
+            SetStatus("Reading " + name + "...");
+
+            worker = new BackgroundWorker { WorkerReportsProgress = true, WorkerSupportsCancellation = true };
+            worker.DoWork += (s, e) =>
             {
+                var w = (BackgroundWorker)s;
                 string folders;
-                int changed;
-                groups = ResultsFile.Load(path, out folders, out changed);
-                txtFolders.Text = folders;
+                var loaded = ResultsFile.Load(path, out folders, fraction => w.ReportProgress((int)(fraction * 1000)), () => w.CancellationPending);
+                if (loaded == null) e.Cancel = true;
+                else e.Result = Tuple.Create(loaded, folders);
+            };
+            worker.ProgressChanged += (s, e) =>
+            {
+                progress.Value = Math.Max(0, Math.Min(e.ProgressPercentage, progress.Maximum));
+                SetStatus(string.Format("Reading {0}: {1}%", name, e.ProgressPercentage / 10));
+            };
+            worker.RunWorkerCompleted += (s, e) =>
+            {
+                if (e.Error != null || e.Cancelled) SetBusy(false);
+                if (e.Error != null)
+                {
+                    SetStatus("Could not load " + name + ".");
+                    MessageBox.Show(this, "Could not load the results:\r\n" + e.Error.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+                if (e.Cancelled) { SetStatus("Loading cancelled; the previous results are unchanged."); return; }
+                var result = (Tuple<List<DupGroup>, string>)e.Result;
+                groups = result.Item1;
+                txtFolders.Text = result.Item2;
+                scanRoots = new List<string>();
                 errors.Clear();
                 ShowErrorsLink();
                 // Files may have changed since the results were saved: compare contents before deleting
                 chkVerify.Checked = true;
+                ShowLoadedList(name, afterLoad);
+            };
+            worker.RunWorkerAsync();
+        }
+
+        // Builds the list of loaded results in the background (seconds with hundreds of
+        // thousands of files), then shows it and starts the disk check. Still busy meanwhile,
+        // so nothing else uses the results.
+        void ShowLoadedList(string name, Action afterLoad)
+        {
+            btnCancel.Enabled = false;
+            progress.Value = 0;
+            SetStatus("Showing the list...");
+            tree.BeginUpdate();
+            tree.Nodes.Clear();
+            tree.EndUpdate();
+            pendingChildren.Clear();
+            pendingParent.Clear();
+            ShowPreview(null);
+            string filter = txtFilter.Text.Trim();
+            int sort = cboSort.SelectedIndex;
+            bool groupView = cboView.SelectedIndex == 1;
+            var clock = Stopwatch.StartNew();
+            System.Threading.Tasks.Task.Factory.StartNew(() => PrepareTree(filter, sort, groupView, fraction =>
+            {
+                // Called in the background; the window is updated about 10 times a second
+                if (clock.ElapsedMilliseconds < 100) return;
+                clock.Restart();
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        progress.Value = Math.Max(0, Math.Min((int)(fraction * progress.Maximum), progress.Maximum));
+                        SetStatus(string.Format("Showing the list: {0}%", (int)(fraction * 100)));
+                    }));
+                }
+                catch (InvalidOperationException) { }   // the window was closed
+            }), System.Threading.Tasks.TaskCreationOptions.LongRunning).ContinueWith(task =>
+            {
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        SetBusy(false);
+                        if (task.Exception != null)
+                        {
+                            groups = new List<DupGroup>();
+                            BuildTree();
+                            SetStatus("Could not load " + name + ".");
+                            MessageBox.Show(this, "Could not show the results:\r\n" + task.Exception.GetBaseException().Message, Text,
+                                            MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            return;
+                        }
+                        ShowTree(task.Result);
+                        CheckLoadedFiles(name, afterLoad);
+                    }));
+                }
+                catch (InvalidOperationException) { }   // the window was closed
+            });
+        }
+
+        // Comparing loaded files with the disk, in the background
+        volatile int diskCheckGeneration;   // changes when a check starts or stops, so an old one ends
+        bool checkingDisk;
+        int loadChanged;
+
+        void CheckLoadedFiles(string name, Action afterLoad)
+        {
+            int generation = ++diskCheckGeneration;
+            var files = groups.SelectMany(g => g.Files).ToList();
+            int total = files.Count;
+            checkingDisk = true;
+            loadChanged = 0;
+            UpdateTotals();   // Delete waits until this is done
+            progress.Style = ProgressBarStyle.Continuous;
+            progress.Maximum = Math.Max(1, total);
+            progress.Value = 0;
+            progress.Visible = true;
+            if (total == 0) { DiskCheckProgress(generation, new List<KeyValuePair<FileEntry, string>>(), 0, 0, name, afterLoad); return; }
+            System.Threading.Tasks.Task.Factory.StartNew(() =>
+            {
+                var cache = new ResultsFile.DiskCache();
+                var found = new List<KeyValuePair<FileEntry, string>>();
+                var clock = Stopwatch.StartNew();
+                for (int i = 0; i < total; i++)
+                {
+                    if (generation != diskCheckGeneration) return;
+                    string reason = ResultsFile.CheckOnDisk(files[i], cache);
+                    if (reason != null) found.Add(new KeyValuePair<FileEntry, string>(files[i], reason));
+                    // The window is updated about once a second (and at the end)
+                    if (i == total - 1 || clock.ElapsedMilliseconds >= 1000)
+                    {
+                        var batch = found;
+                        int done = i + 1;
+                        found = new List<KeyValuePair<FileEntry, string>>();
+                        clock.Restart();
+                        try { BeginInvoke(new Action(() => DiskCheckProgress(generation, batch, done, total, name, afterLoad))); }
+                        catch (InvalidOperationException) { return; }   // the window was closed
+                    }
+                }
+            }, System.Threading.Tasks.TaskCreationOptions.LongRunning);
+        }
+
+        // On the window's thread: marks the files found changed, and finishes at the end
+        void DiskCheckProgress(int generation, List<KeyValuePair<FileEntry, string>> batch, int done, int total, string name, Action afterLoad)
+        {
+            if (IsDisposed || generation != diskCheckGeneration) return;
+            var affected = new HashSet<DupGroup>();
+            foreach (var item in batch)
+            {
+                var f = item.Key;
+                f.StaleReason = item.Value;
+                f.Stale = true;
+                f.Checked = false;
+                loadChanged++;
+                affected.Add(f.Group);
+            }
+            foreach (var g in affected)
+            {
+                // A copy changed: "delete every copy" no longer applies, and one copy must stay
+                g.DeleteAll = false;
+                var mustKeep = Selection.MustKeepOneOf(g);
+                if (mustKeep.Count > 0 && mustKeep.All(x => x.Checked)) mustKeep[0].Checked = false;
+            }
+            if (done < total)
+            {
+                if (affected.Count > 0) RefreshStates();
+                progress.Value = Math.Min(done, progress.Maximum);
+                SetStatus(string.Format("Checking the loaded files on disk: {0:N0} of {1:N0}{2}. You can check files meanwhile; deleting waits until this is done.",
+                                        done, total, loadChanged > 0 ? string.Format(" ({0:N0} changed or missing, shown in gray)", loadChanged) : ""));
+                return;
+            }
+
+            checkingDisk = false;
+            progress.Visible = busy;
+            // Files with fewer than two usable copies left are no longer duplicates
+            int before = groups.Count;
+            groups.RemoveAll(g => g.Valid.Count < 2);
+            if (groups.Count != before)
+            {
+                var selected = SelectedFile();
                 BuildTree();
-                string msg = string.Format("Loaded {0:N0} groups of duplicates from {1}.", groups.Count, Path.GetFileName(path));
-                if (changed > 0) msg += string.Format(" {0:N0} file(s) changed or missing since then are shown in gray and ignored.", changed);
-                SetStatus(msg);
+                if (selected != null && selected.Node != null)
+                {
+                    Reveal(selected.Node);
+                    tree.SelectedNode = selected.Node;
+                    selected.Node.EnsureVisible();
+                }
             }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, "Could not load the results:\r\n" + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            finally
-            {
-                Cursor = Cursors.Default;
-            }
+            else RefreshStates();
+            string msg = string.Format("Loaded {0:N0} groups of duplicates from {1}.", groups.Count, name);
+            if (loadChanged > 0) msg += string.Format(" {0:N0} file(s) changed or missing since then are shown in gray and ignored.", loadChanged);
+            SetStatus(msg);
+            if (afterLoad != null) afterLoad();
+        }
+
+        // Stops a check of loaded files (new results replace them)
+        void StopDiskCheck()
+        {
+            if (!checkingDisk) return;
+            diskCheckGeneration++;
+            checkingDisk = false;
+            progress.Visible = busy;
         }
 
         void ExportCsv()
@@ -4130,14 +4655,24 @@ namespace DuplicateFileFinder
                 grid.DefaultCellStyle.SelectionForeColor = SystemColors.ControlText;
                 var reasonColumn = new DataGridViewTextBoxColumn { HeaderText = "Reason", MinimumWidth = 120 };
                 grid.Columns.Add(reasonColumn);
-                grid.Columns.Add(new DataGridViewLinkColumn { HeaderText = "Path (click to show it in Explorer)", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+                grid.Columns.Add(new DataGridViewLinkColumn { HeaderText = "Path (click to show it in Explorer)", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, MinimumWidth = 200,
                                                               SortMode = DataGridViewColumnSortMode.Automatic, TrackVisitedState = false });
                 foreach (var item in items)
                 {
                     int row = grid.Rows.Add(item.Reason, item.Path);
                     grid.Rows[row].Tag = item.ShowPath;
                 }
-                reasonColumn.AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells;
+                // The reason column fits its text, but takes at most 40% of the width: a long
+                // message pushed the paths out of view (the full text shows on hover)
+                int reasonWidth = -1;
+                Action fitReason = () =>
+                {
+                    if (grid.ClientSize.Width <= 0) return;
+                    if (reasonWidth < 0) reasonWidth = reasonColumn.GetPreferredWidth(DataGridViewAutoSizeColumnMode.AllCells, true);
+                    reasonColumn.Width = Math.Max(reasonColumn.MinimumWidth, Math.Min(reasonWidth, grid.ClientSize.Width * 2 / 5));
+                };
+                dlg.Shown += (s, e) => fitReason();
+                grid.SizeChanged += (s, e) => fitReason();
                 Action<int> show = row =>
                 {
                     if (row < 0) return;
@@ -4189,7 +4724,10 @@ namespace DuplicateFileFinder
                 "   - use Auto-select (keep newest / oldest / shortest path ...) on everything shown, or",
                 "     right-click a folder > \"Auto-select inside this folder\" to apply it to that folder and",
                 "     its subfolders only (copies elsewhere are not changed), or",
+                "   - right-click a folder > \"Keep the copies in this folder (check all others)\", or",
                 "   - right-click a file: \"Keep only this copy\" or \"Check all copies in this folder\".",
+                "   The underlined letters of the right-click menu also work without opening it: with a file",
+                "   selected, O opens it, K keeps only that copy, and so on.",
                 "   At least one copy of each file always stays unchecked: if a folder holds every copy",
                 "   of a file, checking the folder leaves one of them unchecked.",
                 "   Red = will be deleted.  Green = all other copies are checked, so this one is kept.",
