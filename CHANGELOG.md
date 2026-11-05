@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.5.0 - 2026-11-05 - MIT License and README
+
+### Added
+- Released as free software under the MIT License (LICENSE).
+- README with features, download, requirements and build instructions.
+- The program's file properties show "Copyright (c) 2026 Cyberponk. MIT License."
+
 ## v1.4.0 - 2026-11-05 - Fast loading of large results
 
 ### Changed

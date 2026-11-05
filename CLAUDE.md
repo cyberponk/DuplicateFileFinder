@@ -30,8 +30,13 @@ Target PCs include Windows Server 2022 (the user copies the exe to the server's 
   to install it, restarts itself on success, and only tells the user if Windows must restart.
 
 ## Git
-- Local repo only, branch `main`. v1.0.0 is tagged. Personal test files (.dupes, .mp4,
-  .jpg, crash.txt) and the exe are ignored; never commit them.
+- Public on GitHub: https://github.com/cyberponk/DuplicateFileFinder (MIT, branch `main`).
+  Each release is pushed with its tag and published with `gh release create`, with the exe
+  attached. Personal test files (.dupes, .mp4, .jpg, crash.txt) and the exe are ignored;
+  never commit them.
+- Author is "Cyberponk" with no email (set in this repo's git config). Never commit, tag or
+  publish under any other name or email, and never mention a company: this is a personal
+  project.
 
 <!-- repo-versioning -->
 ## Versioning
